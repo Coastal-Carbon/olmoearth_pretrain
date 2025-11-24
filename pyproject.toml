@@ -21,6 +21,7 @@ dependencies = [
     "pandas>=2.2",
     "psutil>=7.1.1",
     "rasterio>=1.4.3",
+    "s3fs>=2025.9.0",
     "shapely>=2",
     "torch>=2.7,<2.8",
     "torchvision>=0.22.1",
