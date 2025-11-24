@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import re
 import shutil
 import time
 from collections.abc import Sequence
@@ -703,18 +704,34 @@ class OlmoEarthDataset(Dataset):
         """
         # Check if metadata CSV exists
         if not self.sample_metadata_path.exists():
-            logger.info("No sample_metadata.csv found. Creating in-memory metadata assuming sentinel2_l2a is always present.")
-            # Create minimal metadata DataFrame assuming sentinel2_l2a (which is guaranteed) is present for all samples
+            logger.info("No sample_metadata.csv found. Generating real metadata by inspecting H5 files.")
+            
+            # Generate real metadata by sampling and inspecting actual H5 files
+            sample_to_check = self.sample_indices[:100]  # Check first 100 files
+            modality_availability = {}
+            
+            for i, sample_idx in enumerate(sample_to_check):
+                sample_file = self.h5py_dir / f"sample_{sample_idx}.h5"
+                if sample_file.exists():
+                    with h5py.File(str(sample_file), 'r') as f:
+                        for modality in self.training_modalities:
+                            if modality not in modality_availability:
+                                modality_availability[modality] = 0
+                            if modality in f and f[modality].size > 0:
+                                modality_availability[modality] += 1
+            
+            # Create metadata for all samples based on what we found
             num_samples = len(self.sample_indices)
             metadata_dict = {}
             
-            # Initialize all training modalities to 1 (assuming they might be present)
-            # This is a conservative approach - we assume all samples are valid for training
             for modality in self.training_modalities:
-                metadata_dict[modality] = [1] * num_samples
+                availability_rate = modality_availability.get(modality, 0) / len(sample_to_check)
+                # Only mark as available if found in >50% of checked samples
+                metadata_dict[modality] = [1 if availability_rate > 0.5 else 0] * num_samples
+                logger.info(f"Modality {modality}: {availability_rate:.1%} availability -> {'available' if availability_rate > 0.5 else 'not available'}")
                 
             metadata_df = pd.DataFrame(metadata_dict)
-            logger.info(f"Created in-memory metadata for {len(metadata_df)} samples with columns: {metadata_df.columns.tolist()}")
+            logger.info(f"Generated real metadata for {len(metadata_df)} samples with columns: {metadata_df.columns.tolist()}")
         else:
             # Read the metadata CSV
             # TODO: Pandas can't read gcs upaths
@@ -798,36 +815,31 @@ class OlmoEarthDataset(Dataset):
         Returns:
             numpy.ndarray: Array of actual sample indices that have corresponding files.
         """
-        import re
-        from upath import UPath
+        # List all files in the directory
+        if isinstance(self.h5py_dir, UPath) and self.h5py_dir.protocol == 's3':
+            # For S3, use glob or ls
+            files = list(self.h5py_dir.glob("sample_*.h5"))
+        else:
+            # For local filesystem
+            files = list(self.h5py_dir.glob("sample_*.h5"))
         
-        try:
-            # List all files in the directory
-            if isinstance(self.h5py_dir, UPath) and self.h5py_dir.protocol == 's3':
-                # For S3, use glob or ls
-                files = list(self.h5py_dir.glob("sample_*.h5"))
-            else:
-                # For local filesystem
-                files = list(self.h5py_dir.glob("sample_*.h5"))
-            
-            # Extract indices from filenames
-            indices = []
-            pattern = re.compile(r'sample_(\d+)\.h5')
-            for file_path in files:
-                match = pattern.search(file_path.name)
-                if match:
-                    indices.append(int(match.group(1)))
-            
-            indices.sort()
-            logger.info(f"Found {len(indices)} sample files with indices from {min(indices)} to {max(indices)}")
-            return np.array(indices)
-            
-        except Exception as e:
-            logger.warning(f"Failed to scan directory for actual indices: {e}")
-            # Fallback to original behavior
+        # Extract indices from filenames
+        indices = []
+        pattern = re.compile(r'sample_(\d+)\.h5')
+        for file_path in files:
+            match = pattern.search(file_path.name)
+            if match:
+                indices.append(int(match.group(1)))
+        
+        if not indices:
+            # No files found - fallback to directory name
             num_samples = int(self.h5py_dir.name)
-            logger.info(f"Using fallback: assuming {num_samples} sequential samples")
+            logger.info(f"No sample files found, using fallback: assuming {num_samples} sequential samples")
             return np.arange(num_samples)
+            
+        indices.sort()
+        logger.info(f"Found {len(indices)} sample files with indices from {min(indices)} to {max(indices)}")
+        return np.array(indices)
     
     def _create_dummy_latlon_distribution(self, num_samples: int) -> np.ndarray:
         """Create dummy lat/lon coordinates for the given number of samples."""
@@ -867,7 +879,8 @@ class OlmoEarthDataset(Dataset):
         # TODO: we can also make modality norm strategy configurable later
         try:
             return self.normalizer_computed.normalize(modality, image)
-        except Exception:
+        except (KeyError, ValueError, AttributeError) as e:
+            logger.debug(f"Computed normalization failed for {modality.name}: {e}, using predefined strategy")
             return self.normalizer_predefined.normalize(modality, image)
 
     def _fill_missing_timesteps(
