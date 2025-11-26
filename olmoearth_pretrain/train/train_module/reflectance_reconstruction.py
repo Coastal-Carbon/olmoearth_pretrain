@@ -15,8 +15,7 @@ import torch
 import torch.nn as nn
 
 from olmoearth_pretrain.data.dataset import OlmoEarthSample
-from olmoearth_pretrain.train.masking import MaskedOlmoEarthSample, MaskValue, MaskingConfig, MaskingStrategy
-from olmoearth_pretrain.train.loss import LossConfig
+from olmoearth_pretrain.train.masking import MaskedOlmoEarthSample
 from olmoearth_pretrain.train.train_module.train_module import (
     OlmoEarthTrainModule,
     OlmoEarthTrainModuleConfig,
@@ -44,7 +43,7 @@ class ReflectanceReconstructionTrainModuleConfig(OlmoEarthTrainModuleConfig):
     loss_type: str = 'l1'  # 'l1', 'l2', or 'huber'
     freeze_encoder: bool = True  # Whether to freeze the pretrained encoder
     reconstruction_weight: float = 1.0  # Weight for reconstruction loss
-    masking_config: "MaskingConfig | None" = None  # Masking strategy configuration
+
     use_mixed_precision: bool = True  # Use AMP for efficiency
     gradient_accumulation_steps: int = 1  # Gradient accumulation
     
@@ -89,13 +88,16 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
         self.use_mixed_precision = use_mixed_precision
         self.gradient_accumulation_steps = gradient_accumulation_steps
         
-        # Initialize masking strategy if provided
-        self.masking_strategy: MaskingStrategy | None = None
-        if masking_config is not None:
-            self.masking_strategy = masking_config.build()
+        # Store normalization stats for inference denormalization
+        self.norm_stats = None  # Will be set from dataset normalizers
         
         # Initialize mixed precision scaler if needed
-        self.scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
+        self.scaler = torch.cuda.amp.GradScaler() if (use_mixed_precision and torch.cuda.is_available()) else None
+        
+        # Safety: disable mixed precision if CUDA not available
+        if use_mixed_precision and not torch.cuda.is_available():
+            self.use_mixed_precision = False
+            logger.warning("Mixed precision disabled: CUDA not available")
         
         # Freeze encoder parameters if requested
         if self.freeze_encoder and hasattr(self.model, 'encoder'):
@@ -109,18 +111,40 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         logger.info(f"Training {trainable_params:,} parameters")
         
-        # Initialize metrics tracking
-        self.accumulated_loss = 0.0
-        self.accumulation_count = 0
+    def set_normalization_stats(self, normalizer_computed, normalizer_predefined):
+        """Set normalization statistics for target normalization and inference denormalization."""
+        self.normalizer_computed = normalizer_computed
+        self.normalizer_predefined = normalizer_predefined
+        logger.info("Normalization stats set for inference-ready model")
         
-        # Loss tracking for plotting (with limited size to prevent memory growth)
-        self.loss_history = []
-        self.step_count = 0
-        self.max_history_size = 1000  # Limit history to prevent memory issues
+    def denormalize_predictions(self, predictions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Denormalize predictions back to original satellite reflectance units for inference."""
+        if not hasattr(self, 'normalizer_computed') or not hasattr(self, 'normalizer_predefined'):
+            logger.warning("No normalization stats available for denormalization")
+            return predictions
+            
+        from olmoearth_pretrain.data.constants import Modality
         
-        # Initialize step tracking to prevent duplicate logging
-        self._logged_global_steps = set()
-        self._step_modality_losses = {}
+        denormalized_preds = {}
+        for modality, pred in predictions.items():
+            try:
+                modality_spec = Modality.get(modality)
+                pred_np = pred.detach().cpu().numpy()
+                
+                # Apply inverse normalization (computed first, then predefined fallback)
+                try:
+                    denorm_np = self.normalizer_computed.denormalize(modality_spec, pred_np)
+                    logger.debug(f"Applied computed denormalization to {modality} predictions")
+                except (KeyError, ValueError, AttributeError) as e:
+                    logger.debug(f"Computed denormalization failed for {modality}: {e}, using predefined")
+                    denorm_np = self.normalizer_predefined.denormalize(modality_spec, pred_np)
+                
+                denormalized_preds[modality] = torch.from_numpy(denorm_np).to(pred.device, dtype=pred.dtype)
+            except Exception as e:
+                logger.warning(f"Could not denormalize {modality}: {e}, keeping normalized")
+                denormalized_preds[modality] = pred
+                
+        return denormalized_preds
     
     def loss_fn(
         self, 
@@ -128,124 +152,132 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
         targets: Dict[str, torch.Tensor],
         masks: Optional[Dict[str, torch.Tensor]] = None
     ) -> torch.Tensor:
-        """Compute reconstruction loss with optional masking.
-        
+        """Simple reconstruction loss following OlmoEarth patterns.
+
         Args:
             reconstructions: Dictionary of reconstructed tensors by modality.
-            targets: Dictionary of target tensors by modality.
-            masks: Optional dictionary of valid pixel masks by modality.
+            targets: Dictionary of target tensors by modality.  
+            masks: Optional dictionary of valid pixel masks (unused).
             
         Returns:
             Combined reconstruction loss.
         """
-        total_loss = torch.tensor(0.0, device=self.device)
+        import torch.nn.functional as F
+        
+        total_loss = 0.0
         valid_modalities = 0
         
         for modality in self.target_modalities:
             if modality not in reconstructions or modality not in targets:
                 continue
                 
-            pred = reconstructions[modality]
-            target = targets[modality]
+            pred = reconstructions[modality]  # May be [B, H, W, C] or [B, H, W, T, C]
+            target = targets[modality]        # [B, H, W, T, C] or [B, H, W, C]
             
-            # Apply mask if provided
-            if masks is not None and modality in masks:
-                mask = masks[modality]
-                pred = pred * mask
-                target = target * mask
+            # Handle temporal dimension properly - preserve time structure for missing data reconstruction
+            if target.dim() == 5 and pred.dim() == 4:  # Target has time, pred doesn't
+                # Prediction is spatially consistent - expand to match target temporal dimension
+                pred = pred.unsqueeze(3).repeat(1, 1, 1, target.shape[3], 1)  # [B, H, W, T, C]
+            elif target.dim() == 4 and pred.dim() == 5:  # Pred has time, target doesn't
+                # This shouldn't happen in supervised reconstruction, but handle gracefully
+                pred = pred.mean(dim=3)  # [B, H, W, C]
             
-            # Handle shape mismatch between prediction and target
-            print(f"DEBUG: Loss computation for {modality}: pred shape {pred.shape}, target shape {target.shape}")
-            
-            # Ensure target and prediction have compatible shapes
-            if len(target.shape) == 5:  # [B, H, W, T, C]
-                # Flatten spatial and temporal dimensions for comparison
-                batch_size, h, w, t, c = target.shape
-                target = target.reshape(batch_size, h * w * t, c)
-            elif len(target.shape) == 4:  # [B, H, W, C]
-                batch_size, h, w, c = target.shape
-                target = target.reshape(batch_size, h * w, c)
-            
-            if len(pred.shape) == 4:  # [B, H, W, C]
-                batch_size, h, w, c = pred.shape
-                pred = pred.reshape(batch_size, h * w, c)
-            
-            # Now both should be [B, N, C] format - subsample prediction to match target size
-            if pred.shape[1] != target.shape[1]:
-                # Subsample prediction to match target token count
-                indices = torch.linspace(0, pred.shape[1] - 1, target.shape[1], dtype=torch.long, device=pred.device)
-                pred = pred[:, indices, :]
+            # Handle spatial mismatches using interpolation
+            if pred.shape[:3] != target.shape[:3]:
+                # Handle both 4D and 5D tensors for spatial interpolation
+                if pred.dim() == 5:  # [B, H, W, T, C]
+                    # Reshape to [B*T, C, H, W] for interpolation
+                    B, H, W, T, C = pred.shape
+                    pred_reshaped = pred.permute(0, 3, 4, 1, 2).reshape(B*T, C, H, W)
+                    
+                    BT, HT, WT, TT, CT = target.shape
+                    target_reshaped = target.permute(0, 3, 4, 1, 2).reshape(BT*TT, CT, HT, WT)
+                else:  # [B, H, W, C]
+                    pred_reshaped = pred.permute(0, 3, 1, 2)
+                    target_reshaped = target.permute(0, 3, 1, 2)
                 
-            print(f"DEBUG: After reshaping - pred shape {pred.shape}, target shape {target.shape}")
+                if pred_reshaped.shape[-2:] != target_reshaped.shape[-2:]:
+                    pred_reshaped = F.interpolate(
+                        pred_reshaped.float(),
+                        size=target_reshaped.shape[-2:],
+                        mode='bilinear',
+                        align_corners=True
+                    )
+                
+                # Reshape back to original format
+                if pred.dim() == 5:  # [B, H, W, T, C]
+                    pred = pred_reshaped.reshape(B, T, C, target_reshaped.shape[-2], target_reshaped.shape[-1]).permute(0, 3, 4, 1, 2)
+                    target = target_reshaped.reshape(BT, TT, CT, target_reshaped.shape[-2], target_reshaped.shape[-1]).permute(0, 3, 4, 1, 2)
+                else:  # [B, H, W, C]
+                    pred = pred_reshaped.permute(0, 2, 3, 1)
+                    target = target_reshaped.permute(0, 2, 3, 1)
             
-            # Ultra-conservative tensor size to ensure stability
-            max_pixels = 500  # Even smaller limit for stability
-            if pred.shape[1] > max_pixels:
-                print(f"DEBUG: Limiting tensor size from {pred.shape[1]} to {max_pixels} pixels for {modality}")
-                # Take a deterministic subset to avoid memory allocation for randperm
-                pred = pred[:, :max_pixels, :]
-                target = target[:, :max_pixels, :]
-                print(f"DEBUG: Limited shapes - pred: {pred.shape}, target: {target.shape}")
+            # CRITICAL: Filter missing values BEFORE normalization to prevent extreme outliers
+            from olmoearth_pretrain.data.constants import MISSING_VALUE, SENTINEL1_NODATA
             
-            print(f"DEBUG: Starting {self.loss_type} loss computation for {modality}...")
-            print(f"DEBUG: Tensor memory usage - pred: {pred.numel() * 4 / 1024 / 1024:.2f} MB")
+            # Create comprehensive missing value mask - check for common satellite missing values
+            missing_value_mask = (
+                (target == MISSING_VALUE) |           # OlmoEarth missing value (-99999)
+                (target == SENTINEL1_NODATA) |        # Sentinel-1 no data (-32768)
+                (torch.abs(target) > 50000) |         # Extreme outliers (likely missing data sentinels)
+                (~torch.isfinite(target)) |           # NaN/Inf values
+                (~torch.isfinite(pred))               # Ensure predictions are also finite
+            )
+            valid_mask = ~missing_value_mask
             
-            # Aggressive memory management
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()  # Ensure operations complete before continuing
+            # Store original range for logging if needed
+            if valid_mask.any():
+                valid_target_orig = target[valid_mask]
+                original_target_min = valid_target_orig.min().item()
+                original_target_max = valid_target_orig.max().item()
+            else:
+                original_target_min = float('nan')
+                original_target_max = float('nan')
             
-            # Compute loss based on type with clamping to prevent explosion
+            # Use targets as-is (dataset should have normalized them)
+            target_normalized = target
+            
+            if not valid_mask.any():
+                logger.warning(f"No valid pixels for {modality}, skipping")
+                continue
+            
+            # Extract valid values for loss computation (using normalized targets)
+            valid_pred = pred[valid_mask]
+            valid_target_norm = target_normalized[valid_mask]
+            valid_target_orig = target[valid_mask]  # Keep original for logging
+            
+
+            
+            # Compute loss only on valid pixels (using normalized targets)
             if self.loss_type == 'l1':
-                loss = nn.functional.l1_loss(pred, target, reduction='mean')
+                loss = F.l1_loss(valid_pred, valid_target_norm)
             elif self.loss_type == 'l2':
-                loss = nn.functional.mse_loss(pred, target, reduction='mean')
+                loss = F.mse_loss(valid_pred, valid_target_norm)
             elif self.loss_type == 'huber':
-                loss = nn.functional.huber_loss(pred, target, reduction='mean')
+                loss = F.huber_loss(valid_pred, valid_target_norm)
             else:
                 raise ValueError(f"Unknown loss type: {self.loss_type}")
             
-            # Clamp loss to prevent explosion (anything above 10.0 is likely unstable)
-            loss = torch.clamp(loss, max=10.0)
+            # Report high losses but let the model learn naturally
+            if loss.item() > 5000:  # Only log very high losses
+                logger.info(f"📊 {modality} loss: {loss.item():.1f} (valid pixels: {100*valid_mask.float().mean():.1f}%)")
             
-            print(f"DEBUG: Completed {self.loss_type} loss computation for {modality}, loss: {loss.item():.6f}")
-            
-            # Skip this modality if loss is unstable (>5.0 indicates problems)
-            if loss.item() > 5.0:
-                print(f"WARNING: Skipping unstable loss for {modality}: {loss.item():.6f}")
-                continue
-            
-            # Store for loss history tracking
-            if not hasattr(self, '_last_modality_losses'):
-                self._last_modality_losses = {}
-            self._last_modality_losses[modality] = loss.item()
-            
-            total_loss += loss
-            valid_modalities += 1
-            
-            # Store per-modality loss for later logging (to avoid duplicates)
-            if not hasattr(self, '_step_modality_losses'):
-                self._step_modality_losses = {}
-            if self.trainer.global_step not in self._step_modality_losses:
-                self._step_modality_losses[self.trainer.global_step] = {}
-            
-            self._step_modality_losses[self.trainer.global_step][modality] = loss.item()
+            if torch.isfinite(loss):
+                total_loss += loss
+                valid_modalities += 1
         
         if valid_modalities == 0:
-            print("WARNING: No valid modalities for loss computation, returning small loss")
-            return torch.tensor(0.001, device=self.device, requires_grad=True)
+            return torch.tensor(0.0, requires_grad=True, device=self.device)
         
-        # Average over modalities and apply weight
-        avg_loss = (total_loss / valid_modalities) * self.reconstruction_weight
+        final_loss = (total_loss / valid_modalities) * self.reconstruction_weight
         
-        # Final safety check - if average loss is still too high, clamp it
-        if avg_loss.item() > 2.0:
-            print(f"WARNING: Clamping high average loss from {avg_loss.item():.6f} to 2.0")
-            avg_loss = torch.clamp(avg_loss, max=2.0)
-        
-        return avg_loss
+        # Let large losses happen - this is normal learning!
+        if final_loss.item() > 50000:  # Only flag truly extreme cases
+            logger.info(f"📈 High loss during learning: {final_loss.item():.1f}")
+            logger.info(f"   Reconstruction head is learning - this should decrease over time")
+            logger.info(f"   Training {valid_modalities} modalities: {self.target_modalities}")
+            
+        return final_loss
     
     def compute_loss(
         self, 
@@ -255,22 +287,7 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
         """Compute reconstruction loss between predictions and targets."""
         return self.loss_fn(predictions, targets)
     
-    def create_masked_sample(self, sample: OlmoEarthSample, patch_size: int) -> MaskedOlmoEarthSample:
-        """Create masked sample for reconstruction training.
-        
-        Args:
-            sample: Original OlmoEarth sample.
-            patch_size: Patch size for masking.
-            
-        Returns:
-            Masked sample using proper OlmoEarth masking strategy.
-        """
-        if self.masking_strategy is not None:
-            # Use the proper OlmoEarth masking strategy
-            return self.masking_strategy.apply_mask(sample, patch_size=patch_size)
-        else:
-            # No masking - just convert to MaskedOlmoEarthSample
-            return MaskedOlmoEarthSample.from_olmoearthsample(sample)
+
     
     def extract_reconstruction_targets(
         self, 
@@ -294,34 +311,32 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
     
     def model_forward(
         self,
-        masked_sample: MaskedOlmoEarthSample,
+        sample: OlmoEarthSample,
         patch_size: int,
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Run forward pass through model.
+        """Run forward pass through model using simple supervised learning pattern.
         
         Args:
-            masked_sample: Masked input sample.
+            sample: Regular OlmoEarth sample.
             patch_size: Patch size for the model.
             
         Returns:
             Tuple of (reconstructions, loss).
         """
-        # Forward pass through model
+        # Forward pass - the reconstruction model handles masking and fast_pass internally
         results = self.model(
-            masked_sample,
+            sample,
             patch_size=patch_size,
             target_modalities=self.target_modalities
         )
         
-        # Extract targets from original sample using unmask method
-        unmasked_sample = masked_sample.unmask()
-        targets = self.extract_reconstruction_targets(unmasked_sample)
+        # Extract targets from original sample
+        targets = self.extract_reconstruction_targets(sample)
         
         # Compute reconstruction loss
         loss = self.loss_fn(
             results['reconstructions'], 
-            targets,
-            masks=results.get('masks')
+            targets
         )
         
         return results['reconstructions'], loss
@@ -331,7 +346,7 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
         batch: Tuple[int, OlmoEarthSample], 
         dry_run: bool = False
     ) -> None:
-        """Train on a batch with reconstruction objective.
+        """Clean reconstruction training following evaluation task patterns.
         
         Args:
             batch: Tuple of (patch_size, sample_batch).
@@ -352,10 +367,6 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
         
         for microbatch_idx, microbatch in enumerate(microbatches):
             with self._train_microbatch_context(microbatch_idx, num_microbatches):
-                logger.info(
-                    f"Training microbatch {microbatch_idx} of {num_microbatches} with batch size {microbatch.batch_size}"
-                )
-                
                 # Apply transforms if available
                 if hasattr(self, 'transform') and self.transform is not None:
                     microbatch = self.transform.apply(microbatch)
@@ -363,127 +374,57 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
                 # Move to device
                 microbatch = microbatch.to_device(self.device)
                 
-                # Use autocast for mixed precision forward pass
+                # Use autocast for mixed precision
                 autocast_context = torch.cuda.amp.autocast() if self.use_mixed_precision else contextlib.nullcontext()
                 
                 with autocast_context:
-                    # Create masked sample for reconstruction
-                    masked_sample = self.create_masked_sample(microbatch, patch_size)
-                    
-                    # Forward pass through reconstruction head
-                    predictions, embedding = self.model_forward(masked_sample, patch_size)
-                    
-                    # Get reconstruction targets
-                    unmasked_sample = masked_sample.unmask()
-                    targets = self.extract_reconstruction_targets(unmasked_sample)
-                    
-                    # Compute loss
-                    print(f"DEBUG: Computing loss for microbatch {microbatch_idx}...")
-                    loss = self.compute_loss(predictions, targets)
-                    print(f"DEBUG: Raw loss: {loss.item():.6f}")
+                    # Forward pass using evaluation pattern
+                    predictions, loss = self.model_forward(microbatch, patch_size)
                     
                     # Scale loss for gradient accumulation
                     loss = loss / num_microbatches
-                    print(f"DEBUG: Scaled loss: {loss.item():.6f}")
                 
                 total_loss += loss.detach()
                 
                 if not dry_run:
-                    print(f"DEBUG: Starting backward pass for microbatch {microbatch_idx}...")
-                    # Use scaler for mixed precision backward pass
+                    # Backward pass
                     if self.use_mixed_precision and self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
-                    print(f"DEBUG: Completed backward pass for microbatch {microbatch_idx}")
         
         if not dry_run:
-            # Perform optimizer step
+            # Gradient clipping and optimizer step
             if self.use_mixed_precision and self.scaler is not None:
-                # Mixed precision optimization step
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                try:
+                    # Unscale gradients before clipping
+                    self.scaler.unscale_(self.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    
+                    # Step with scaler (this checks for inf/nan)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                except AssertionError as e:
+                    if "No inf checks were recorded" in str(e):
+                        logger.error(f"Mixed precision error: {e}")
+                        logger.error("Falling back to FP32 for this step")
+                        # Fallback to regular optimization
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        self.optimizer.step()
+                    else:
+                        raise
             else:
-                # Regular optimization step
-                self.optimizer.step()
-            
-            # Check gradient norm before stepping
-            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            if total_norm > 10.0:  # Skip update if gradients are too large
-                print(f"WARNING: Skipping optimizer step due to large gradients: {total_norm:.2f}")
-                self.optimizer.zero_grad()
-                return loss, targets
-            
-            # Zero gradients for next iteration
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()            # Zero gradients
             self.optimizer.zero_grad()
             
-            print(f"DEBUG: Gradient norm: {total_norm:.4f}")
+            # Record metrics with higher precision
+            self.trainer.record_metric("train/reconstruction_loss", total_loss)
+            self.trainer.record_metric("optim/total_grad_norm", float(grad_norm))
             
-            # Record metrics (only once per step to avoid duplicates)
-            current_step = self.trainer.global_step
-            if not hasattr(self, '_logged_global_steps'):
-                self._logged_global_steps = set()
-                
-            if current_step not in self._logged_global_steps:
-                self.trainer.record_metric("train/reconstruction_loss", total_loss)
-                
-                # Log individual modality losses from this step
-                if hasattr(self, '_step_modality_losses') and current_step in self._step_modality_losses:
-                    for mod_name, mod_loss in self._step_modality_losses[current_step].items():
-                        self.trainer.record_metric(f"reconstruction_loss/{mod_name}", mod_loss, namespace="train")
-                
-                self._logged_global_steps.add(current_step)
-                
-                # Clean up old step data to prevent memory leaks
-                if hasattr(self, '_step_modality_losses'):
-                    # Keep only last 10 steps
-                    steps_to_keep = sorted(self._step_modality_losses.keys())[-10:]
-                    self._step_modality_losses = {k: v for k, v in self._step_modality_losses.items() if k in steps_to_keep}
-            
-            # Track loss history for plotting
-            self.step_count += 1
-            loss_entry = {
-                'step': self.step_count,
-                'total_loss': total_loss.item(),
-                'modality_losses': {}
-            }
-            
-            # Store individual modality losses from the last computation
-            if hasattr(self, '_last_modality_losses'):
-                loss_entry['modality_losses'] = self._last_modality_losses.copy()
-            
-            self.loss_history.append(loss_entry)
-            
-            # Limit history size to prevent memory growth
-            if len(self.loss_history) > self.max_history_size:
-                self.loss_history = self.loss_history[-self.max_history_size//2:]  # Keep last half
-            
-            # Save plot every 25 steps to reduce I/O overhead
-            if self.step_count % 25 == 0:
-                try:
-                    self.save_loss_plot()
-                except Exception as e:
-                    print(f"Warning: Could not save loss plot: {e}")
-            
-            print(f"DEBUG: Completed optimization step, total_loss: {total_loss.item():.6f}")
-            
-            # Aggressive memory cleanup
-            del batch, batch_data, microbatches
-            if hasattr(self, '_last_modality_losses'):
-                del self._last_modality_losses
-            
-            # Force garbage collection after each step
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                
-                # Monitor GPU memory every few steps
-                if self.step_count % 5 == 0:
-                    allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                    reserved = torch.cuda.memory_reserved() / 1024**3   # GB
-                    print(f"DEBUG: GPU memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            # Debug logging with high precision (every 100 steps to avoid spam)
+            if hasattr(self.trainer, 'state') and self.trainer.state.global_step % 100 == 0:
+                print(f"[DEBUG] Step {self.trainer.state.global_step}: grad_norm = {grad_norm:.8f}, loss = {total_loss:.8f}")
     
     def eval_batch(
         self, 
@@ -509,86 +450,11 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
             # Move to device
             batch_data = batch_data.to_device(self.device)
             
-            # Create masked sample
-            masked_sample = self.create_masked_sample(batch_data)
+            # Forward pass using evaluation pattern
+            predictions, loss = self.model_forward(batch_data, patch_size)
             
-            # Forward pass
-            predictions, embedding = self.model_forward(masked_sample, patch_size)
+            # Get targets for return value
+            targets = self.extract_reconstruction_targets(batch_data)
             
-            # Get targets
-            unmasked_sample = masked_sample.unmask()
-            targets = self.extract_reconstruction_targets(unmasked_sample)
-            
-            # Compute loss
-            loss = self.compute_loss(predictions, targets)
-        
         return loss, targets
     
-    def save_loss_plot(self, output_dir: str = "./loss_plots"):
-        """Save loss curves as plots."""
-        if not self.loss_history:
-            print("No loss history to plot")
-            return
-        
-        import matplotlib.pyplot as plt
-        import os
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Extract data
-        steps = [entry['step'] for entry in self.loss_history]
-        total_losses = [entry['total_loss'] for entry in self.loss_history]
-        
-        # Get all modalities
-        all_modalities = set()
-        for entry in self.loss_history:
-            all_modalities.update(entry['modality_losses'].keys())
-        
-        # Create plots
-        fig, axes = plt.subplots(2, 1, figsize=(12, 10))
-        
-        # Total loss
-        axes[0].plot(steps, total_losses, 'b-o', linewidth=2, markersize=4)
-        axes[0].set_xlabel('Training Step')
-        axes[0].set_ylabel('Total Loss')
-        axes[0].set_title('Total Reconstruction Loss')
-        axes[0].grid(True, alpha=0.3)
-        axes[0].set_yscale('log')
-        
-        # Modality losses
-        colors = ['green', 'red', 'orange', 'purple', 'brown']
-        for i, modality in enumerate(sorted(all_modalities)):
-            modality_losses = []
-            modality_steps = []
-            for entry in self.loss_history:
-                if modality in entry['modality_losses']:
-                    modality_losses.append(entry['modality_losses'][modality])
-                    modality_steps.append(entry['step'])
-            
-            if modality_losses:
-                color = colors[i % len(colors)]
-                axes[1].plot(modality_steps, modality_losses, 
-                           f'{color}-o', linewidth=2, markersize=4, label=modality)
-        
-        axes[1].set_xlabel('Training Step')
-        axes[1].set_ylabel('Loss')
-        axes[1].set_title('Loss by Modality')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-        axes[1].set_yscale('log')
-        
-        plt.tight_layout()
-        
-        # Save plot
-        plot_path = os.path.join(output_dir, f'loss_curves_step_{self.step_count}.png')
-        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"Loss plot saved to: {plot_path}")
-        
-        # Also save loss data as JSON for later analysis
-        import json
-        json_path = os.path.join(output_dir, f'loss_data_step_{self.step_count}.json')
-        with open(json_path, 'w') as f:
-            json.dump(self.loss_history, f, indent=2)
-        print(f"Loss data saved to: {json_path}")

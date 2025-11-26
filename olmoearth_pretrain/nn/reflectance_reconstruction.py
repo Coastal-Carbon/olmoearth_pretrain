@@ -21,6 +21,7 @@ except ImportError:
 from olmoearth_pretrain.nn.flexi_vit import TokensAndMasks, Encoder
 from olmoearth_pretrain.nn.flexi_patch_embed import FlexiPatchReconstruction
 from olmoearth_pretrain.data.constants import Modality, ModalitySpec
+from olmoearth_pretrain.data.dataset import OlmoEarthSample
 from olmoearth_pretrain.train.masking import MaskedOlmoEarthSample
 
 
@@ -248,16 +249,18 @@ class OlmoEarthWithReflectanceHead(nn.Module):
         # Store config
         self.freeze_encoder = freeze_encoder
         
+
+        
     def forward(
         self, 
-        x: MaskedOlmoEarthSample, 
+        x: OlmoEarthSample, 
         patch_size: int,
         target_modalities: Optional[list[str]] = None,
         return_encoder_output: bool = False
     ) -> dict[str, Any]:
         """
         Args:
-            x: Masked input sample
+            x: Regular input sample (not masked - this is supervised learning)
             patch_size: Patch size for processing
             target_modalities: Which modalities to reconstruct
             return_encoder_output: Whether to return encoder features
@@ -266,8 +269,17 @@ class OlmoEarthWithReflectanceHead(nn.Module):
             Dictionary with reconstructions and optionally encoder features
         """
         
-        # Get encoded representations
-        encoder_output = self.encoder(x, patch_size=patch_size)
+        # Convert to fully visible MaskedOlmoEarthSample following evaluation pattern
+        # This creates fully unmasked samples like other downstream evaluations
+        if isinstance(x, OlmoEarthSample):
+            # Use standard evaluation pattern: all tokens visible
+            masked_x = MaskedOlmoEarthSample.from_olmoearthsample(x)
+        else:
+            # If already a MaskedOlmoEarthSample, use it directly
+            masked_x = x
+            
+        # Get encoded representations with fast_pass=True for downstream evaluation
+        encoder_output = self.encoder(masked_x, patch_size=patch_size, fast_pass=True)
         
         # Extract tokens_and_masks from encoder output
         if isinstance(encoder_output, dict) and 'tokens_and_masks' in encoder_output:

@@ -30,6 +30,7 @@ from olmo_core.train.config import TrainerConfig
 from olmoearth_pretrain.data.constants import Modality
 from olmoearth_pretrain.data.dataloader import OlmoEarthDataLoaderConfig
 from olmoearth_pretrain.data.dataset import OlmoEarthDatasetConfig
+from olmoearth_pretrain.data.concat import OlmoEarthConcatDatasetConfig
 from olmoearth_pretrain.internal.common import (
     build_common_components as build_common_components_default,
 )
@@ -45,6 +46,8 @@ from olmoearth_pretrain.train.callbacks import (
     OlmoEarthSpeedMonitorCallback,
     OlmoEarthWandBCallback,
 )
+from olmoearth_pretrain.train.callbacks.validation_evaluator import ValidationEvaluatorCallbackConfig
+from olmoearth_pretrain.train.callbacks.high_precision_console_logger import HighPrecisionConsoleLoggerCallback
 from olmoearth_pretrain.train.callbacks.evaluator_callback import DownstreamTaskConfig
 from olmoearth_pretrain.train.loss import LossConfig
 from olmoearth_pretrain.train.masking import MaskingConfig
@@ -117,7 +120,7 @@ def build_model_config(common: CommonComponents) -> ReflectanceReconstructionCon
         # Reconstruction head configuration
         target_modalities=['sentinel2_l2a', 'landsat'],  # Override with: model.target_modalities=...
         freeze_encoder=True,  # Override with: model.freeze_encoder=...
-        use_sigmoid_output=True,  # Override with: model.use_sigmoid_output=...
+        use_sigmoid_output=False,  # Override with: model.use_sigmoid_output=... (FIXED: Train on raw satellite values)
         hidden_size_multiplier=1.0,  # Override with: model.hidden_size_multiplier=...
         
         # No patch size overrides - use model's original settings
@@ -133,7 +136,7 @@ def build_train_module_config(
     
     # Optimizer configuration with conservative learning rate
     optim_config = AdamWConfig(
-        lr=1e-5,  # Reduced from 1e-4 to prevent gradient explosion
+        lr=1e-4,  # Increased for better convergence on reconstruction task
         betas=(0.9, 0.999),  # More stable beta2
         eps=1e-8,  # Smaller epsilon for numerical stability
         weight_decay=1e-3,  # Reduced weight decay
@@ -154,14 +157,7 @@ def build_train_module_config(
             alpha_f=0.01,  # Don't decay LR too much
         ),
         
-        # Masking configuration for reconstruction training
-        masking_config=MaskingConfig(
-            strategy_config={
-                "type": "random",
-                "encode_ratio": 0.3,  # Keep 30% of tokens visible to encoder 
-                "decode_ratio": 0.7,  # Reconstruct 70% of tokens
-            }
-        ),
+
         
         # Reconstruction-specific settings
         target_modalities=['sentinel2_l2a', 'landsat'],  # Override with: train_module.target_modalities=...
@@ -186,40 +182,77 @@ def build_dataloader_config(common: CommonComponents) -> OlmoEarthDataLoaderConf
         min_patch_size=MIN_PATCH_SIZE,    # Match model's min_patch_size 
         max_patch_size=MAX_PATCH_SIZE,    # Match model's max_patch_size 
         sampled_hw_p_list=[4, 8],  # Height/width in patches: 128/32=4, 128/16=8
-        token_budget=None,    # No token budget limit for reconstruction
+        token_budget=1500,    # Token budget to prevent memory explosion (was None)
         drop_last=False,      # Don't drop incomplete batches to handle missing data better
         shuffle=True,         # Shuffle training data
         num_dataset_repeats_per_epoch=1,  # Single pass through dataset per epoch
     )
 
 
-def build_dataset_config(common: CommonComponents) -> OlmoEarthDatasetConfig:
-    """Build dataset config for reflectance reconstruction."""
-    return OlmoEarthDatasetConfig(
-        # Dataset directory - using the user's specific dataset
-        h5py_dir=(
-            's3://cc-dataocean/scratch/20251114_olmo_example/'
-            'h5py_data_w_missing_timesteps_zstd_3_128_x_4/'
-            'cdl_gse_landsat_openstreetmap_raster_'
-            'sentinel1_sentinel2_l2a_srtm_worldcereal_worldcover_worldpop_wri_canopy_height_map/'
-            '1138828/'
-        ),  # Override with: dataset.h5py_dir=...
-        
-        # Training modalities (use common.training_modalities)
-        training_modalities=common.training_modalities,  # ['sentinel2_l2a', 'sentinel1', 'landsat']
-        
-        # Data configuration
-        dtype="float32",  # Override with: dataset.dtype=...
-        normalize=True,  # Override with: dataset.normalize=...
-        cache_dir=None,  # Override with: dataset.cache_dir=...
-        dataset_percentage=1.0,  # Override with: dataset.dataset_percentage=...
-        seed=0,  # Override with: dataset.seed=...
+def build_dataset_config(common: CommonComponents) -> OlmoEarthConcatDatasetConfig:
+    """Build dataset config for reflectance reconstruction with train/validation split."""
+    
+    # Base dataset configuration 
+    base_h5py_dir = (
+        's3://cc-dataocean/scratch/20251114_olmo_example/'
+        'h5py_data_w_missing_timesteps_zstd_3_128_x_4/'
+        'cdl_gse_landsat_openstreetmap_raster_'
+        'sentinel1_sentinel2_l2a_srtm_worldcereal_worldcover_worldpop_wri_canopy_height_map/'
+        '1138828/'
+    )
+    
+    # Create train and validation datasets with different seeds and percentages
+    train_dataset = OlmoEarthDatasetConfig(
+        h5py_dir=base_h5py_dir,
+        training_modalities=common.training_modalities,
+        dtype="float32",
+        normalize=True,
+        cache_dir=None,
+        dataset_percentage=0.8,  # 80% for training
+        seed=42,  # Fixed seed for reproducible splits
+    )
+    
+    val_dataset = OlmoEarthDatasetConfig(
+        h5py_dir=base_h5py_dir, 
+        training_modalities=common.training_modalities,
+        dtype="float32", 
+        normalize=True,
+        cache_dir=None,
+        dataset_percentage=0.2,  # 20% for validation
+        seed=1337,  # Different seed to get different samples
+    )
+    
+    # Concatenate both datasets
+    return OlmoEarthConcatDatasetConfig(
+        dataset_configs=[train_dataset, val_dataset]
     )
 
 
 def build_trainer_config(common: CommonComponents) -> TrainerConfig:
     """Build trainer config for reflectance reconstruction."""
     checkpointer_config = CheckpointerConfig(work_dir=common.save_folder)
+    
+    # Wandb configuration - set your project name and entity (username/organization)
+    wandb_callback = OlmoEarthWandBCallback(
+        name=common.run_name,  # Use the run name from common components
+        project="olmoearth-reconstruction",  # Your wandb project name - change this to your preference
+        entity=None,  # Your wandb username/org - will use default if None
+        enabled=True,  # Set to False to disable wandb logging
+        # Optional: add tags for better organization
+        tags=["reconstruction", "satellite", "olmoearth"],
+        # OlmoEarth specific settings
+        upload_dataset_distribution_pre_train=True,  # Upload dataset stats to wandb
+        upload_modality_data_band_distribution_pre_train=False,  # Skip detailed band stats for speed
+        restart_on_same_run=True,  # Allow resuming runs
+    )
+    
+    # Validation evaluator callback - evaluate on validation set every 500 steps
+    validation_evaluator = ValidationEvaluatorCallbackConfig(
+        eval_interval=Duration(500, "steps"),  # Validate every 500 steps
+        dataset_config=build_dataset_config(common),  # Pass dataset config
+        dataloader_config=build_dataloader_config(common),  # Pass dataloader config
+        enabled=True,  # Set to False to disable validation evaluation
+    )
     
     trainer_config = (
         TrainerConfig(
@@ -231,6 +264,9 @@ def build_trainer_config(common: CommonComponents) -> TrainerConfig:
             load_strategy=LoadStrategy.if_available,
             checkpointer=checkpointer_config,
         )
+        .with_callback("console_logger", HighPrecisionConsoleLoggerCallback(metrics_log_interval=100))  # High precision console logging
+        .with_callback("wandb", wandb_callback)  # Add wandb logging
+        .with_callback("validation_evaluator", validation_evaluator)  # Add validation evaluation
         # .with_callback("speed_monitor", OlmoEarthSpeedMonitorCallback())  # Disabled due to missing _encoder_ratio attribute
         .with_callback("gpu_memory_monitor", GPUMemoryMonitorCallback())
         .with_callback("config_saver", ConfigSaverCallback())
