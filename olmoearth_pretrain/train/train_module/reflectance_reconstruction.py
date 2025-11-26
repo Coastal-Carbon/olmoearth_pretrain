@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 
 from olmoearth_pretrain.data.dataset import OlmoEarthSample
-from olmoearth_pretrain.train.masking import MaskedOlmoEarthSample
+from olmoearth_pretrain.train.masking import MaskedOlmoEarthSample, MaskingConfig
 from olmoearth_pretrain.train.train_module.train_module import (
     OlmoEarthTrainModule,
     OlmoEarthTrainModuleConfig,
@@ -88,8 +88,7 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
         self.use_mixed_precision = use_mixed_precision
         self.gradient_accumulation_steps = gradient_accumulation_steps
         
-        # Store normalization stats for inference denormalization
-        self.norm_stats = None  # Will be set from dataset normalizers
+
         
         # Initialize mixed precision scaler if needed
         self.scaler = torch.cuda.amp.GradScaler() if (use_mixed_precision and torch.cuda.is_available()) else None
@@ -99,52 +98,13 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
             self.use_mixed_precision = False
             logger.warning("Mixed precision disabled: CUDA not available")
         
-        # Freeze encoder parameters if requested
-        if self.freeze_encoder and hasattr(self.model, 'encoder'):
-            frozen_params = 0
-            for param in self.model.encoder.parameters():
-                param.requires_grad = False
-                frozen_params += param.numel()
-            logger.info(f"Frozen {frozen_params:,} encoder parameters")
+        # Parameter freezing is handled by the model configuration
         
         # Count trainable parameters
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         logger.info(f"Training {trainable_params:,} parameters")
         
-    def set_normalization_stats(self, normalizer_computed, normalizer_predefined):
-        """Set normalization statistics for target normalization and inference denormalization."""
-        self.normalizer_computed = normalizer_computed
-        self.normalizer_predefined = normalizer_predefined
-        logger.info("Normalization stats set for inference-ready model")
-        
-    def denormalize_predictions(self, predictions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Denormalize predictions back to original satellite reflectance units for inference."""
-        if not hasattr(self, 'normalizer_computed') or not hasattr(self, 'normalizer_predefined'):
-            logger.warning("No normalization stats available for denormalization")
-            return predictions
-            
-        from olmoearth_pretrain.data.constants import Modality
-        
-        denormalized_preds = {}
-        for modality, pred in predictions.items():
-            try:
-                modality_spec = Modality.get(modality)
-                pred_np = pred.detach().cpu().numpy()
-                
-                # Apply inverse normalization (computed first, then predefined fallback)
-                try:
-                    denorm_np = self.normalizer_computed.denormalize(modality_spec, pred_np)
-                    logger.debug(f"Applied computed denormalization to {modality} predictions")
-                except (KeyError, ValueError, AttributeError) as e:
-                    logger.debug(f"Computed denormalization failed for {modality}: {e}, using predefined")
-                    denorm_np = self.normalizer_predefined.denormalize(modality_spec, pred_np)
-                
-                denormalized_preds[modality] = torch.from_numpy(denorm_np).to(pred.device, dtype=pred.dtype)
-            except Exception as e:
-                logger.warning(f"Could not denormalize {modality}: {e}, keeping normalized")
-                denormalized_preds[modality] = pred
-                
-        return denormalized_preds
+
     
     def loss_fn(
         self, 
@@ -225,42 +185,25 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
             )
             valid_mask = ~missing_value_mask
             
-            # Store original range for logging if needed
-            if valid_mask.any():
-                valid_target_orig = target[valid_mask]
-                original_target_min = valid_target_orig.min().item()
-                original_target_max = valid_target_orig.max().item()
-            else:
-                original_target_min = float('nan')
-                original_target_max = float('nan')
-            
-            # Use targets as-is (dataset should have normalized them)
-            target_normalized = target
-            
             if not valid_mask.any():
                 logger.warning(f"No valid pixels for {modality}, skipping")
                 continue
             
-            # Extract valid values for loss computation (using normalized targets)
+            # Extract valid values for loss computation
             valid_pred = pred[valid_mask]
-            valid_target_norm = target_normalized[valid_mask]
-            valid_target_orig = target[valid_mask]  # Keep original for logging
+            valid_target = target[valid_mask]
             
 
             
-            # Compute loss only on valid pixels (using normalized targets)
+            # Compute loss only on valid pixels
             if self.loss_type == 'l1':
-                loss = F.l1_loss(valid_pred, valid_target_norm)
+                loss = F.l1_loss(valid_pred, valid_target)
             elif self.loss_type == 'l2':
-                loss = F.mse_loss(valid_pred, valid_target_norm)
+                loss = F.mse_loss(valid_pred, valid_target)
             elif self.loss_type == 'huber':
-                loss = F.huber_loss(valid_pred, valid_target_norm)
+                loss = F.huber_loss(valid_pred, valid_target)
             else:
                 raise ValueError(f"Unknown loss type: {self.loss_type}")
-            
-            # Report high losses but let the model learn naturally
-            if loss.item() > 5000:  # Only log very high losses
-                logger.info(f"📊 {modality} loss: {loss.item():.1f} (valid pixels: {100*valid_mask.float().mean():.1f}%)")
             
             if torch.isfinite(loss):
                 total_loss += loss
@@ -270,12 +213,6 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
             return torch.tensor(0.0, requires_grad=True, device=self.device)
         
         final_loss = (total_loss / valid_modalities) * self.reconstruction_weight
-        
-        # Let large losses happen - this is normal learning!
-        if final_loss.item() > 50000:  # Only flag truly extreme cases
-            logger.info(f"📈 High loss during learning: {final_loss.item():.1f}")
-            logger.info(f"   Reconstruction head is learning - this should decrease over time")
-            logger.info(f"   Training {valid_modalities} modalities: {self.target_modalities}")
             
         return final_loss
     
@@ -396,35 +333,25 @@ class ReflectanceReconstructionTrainModule(OlmoEarthTrainModule):
         if not dry_run:
             # Gradient clipping and optimizer step
             if self.use_mixed_precision and self.scaler is not None:
-                try:
-                    # Unscale gradients before clipping
-                    self.scaler.unscale_(self.optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    
-                    # Step with scaler (this checks for inf/nan)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                except AssertionError as e:
-                    if "No inf checks were recorded" in str(e):
-                        logger.error(f"Mixed precision error: {e}")
-                        logger.error("Falling back to FP32 for this step")
-                        # Fallback to regular optimization
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                        self.optimizer.step()
-                    else:
-                        raise
+                # Unscale gradients before clipping
+                self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                
+                # Step with scaler (this checks for inf/nan)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()            # Zero gradients
+                self.optimizer.step()
+            
+            # Zero gradients
             self.optimizer.zero_grad()
             
-            # Record metrics with higher precision
+            # Record metrics
             self.trainer.record_metric("train/reconstruction_loss", total_loss)
-            self.trainer.record_metric("optim/total_grad_norm", float(grad_norm))
+            self.trainer.record_metric("optim/total_grad_norm", grad_norm)
             
-            # Debug logging with high precision (every 100 steps to avoid spam)
-            if hasattr(self.trainer, 'state') and self.trainer.state.global_step % 100 == 0:
-                print(f"[DEBUG] Step {self.trainer.state.global_step}: grad_norm = {grad_norm:.8f}, loss = {total_loss:.8f}")
+
     
     def eval_batch(
         self, 

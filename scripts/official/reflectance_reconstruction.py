@@ -48,38 +48,14 @@ from olmoearth_pretrain.train.callbacks import (
 )
 from olmoearth_pretrain.train.callbacks.validation_evaluator import ValidationEvaluatorCallbackConfig
 from olmoearth_pretrain.train.callbacks.high_precision_console_logger import HighPrecisionConsoleLoggerCallback
-from olmoearth_pretrain.train.callbacks.evaluator_callback import DownstreamTaskConfig
-from olmoearth_pretrain.train.loss import LossConfig
-from olmoearth_pretrain.train.masking import MaskingConfig
-
 from olmoearth_pretrain.train.train_module.reflectance_reconstruction import (
     ReflectanceReconstructionTrainModuleConfig,
 )
-from olmoearth_pretrain.train.masking import MaskingConfig
 from olmoearth_pretrain.model_loader import ModelID
 from olmoearth_pretrain.nn.reflectance_reconstruction import (
     ReflectanceReconstructionConfig
 )
 
-
-def robust_olmoearth_collator(batch):
-    """Custom collator that handles missing data in OlmoEarth samples."""
-    # Extract samples from batch (handle tuples if present)
-    samples = []
-    for item in batch:
-        if isinstance(item, tuple) and len(item) == 2:
-            _, sample = item
-            samples.append(sample)
-        else:
-            samples.append(item)
-    
-    # Use OlmoEarth's built-in collation method if available
-    if samples and hasattr(samples[0], 'collate'):
-        return samples[0].collate(samples)
-    
-    # Fallback to default collation
-    from torch.utils.data import default_collate
-    return default_collate(samples)
 
 logger = logging.getLogger(__name__)
 
