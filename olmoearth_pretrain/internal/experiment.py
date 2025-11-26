@@ -269,8 +269,14 @@ def train(config: OlmoEarthExperimentConfig) -> None:
     model = config.model.build()
     device = get_default_device()
     model = model.to(device)
-    train_module = config.train_module.build(model)
     dataset = config.dataset.build()
+    train_module = config.train_module.build(model)
+    
+    # Set normalization stats for inference-ready reconstruction training
+    if hasattr(train_module, 'set_normalization_stats') and hasattr(dataset, 'normalizer_computed') and hasattr(dataset, 'normalizer_predefined'):
+        train_module.set_normalization_stats(dataset.normalizer_computed, dataset.normalizer_predefined)
+        logger.info("Set normalization stats from dataset to train module for inference-ready model")
+    
     # TODO: akward harcoding of the collator here
     data_loader = config.data_loader.build(
         dataset,
@@ -281,7 +287,8 @@ def train(config: OlmoEarthExperimentConfig) -> None:
 
     # Record the config to W&B/Comet and each checkpoint dir.
     config_dict = config.as_config_dict()
-    cast(WandBCallback, trainer.callbacks["wandb"]).config = config_dict
+    if "wandb" in trainer.callbacks:
+        cast(WandBCallback, trainer.callbacks["wandb"]).config = config_dict
     cast(ConfigSaverCallback, trainer.callbacks["config_saver"]).config = config_dict
     trainer.fit()
 

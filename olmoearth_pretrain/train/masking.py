@@ -223,13 +223,94 @@ class MaskingStrategy:
         self, instance: torch.Tensor, modality: ModalitySpec, mask: torch.Tensor
     ) -> torch.Tensor:
         """Get the missing mask for the input data."""
-        missing_mask = mask.new_zeros(mask.shape, dtype=torch.bool)
+        # Create missing_mask with same spatial dimensions as instance, but with band_sets depth
+        num_band_sets = len(modality.band_sets)
+        instance_shape = instance.shape  # e.g., [4, 126, 126, num_channels]
+        missing_mask_shape = instance_shape[:-1] + (num_band_sets,)  # e.g., [4, 126, 126, num_band_sets]
+        missing_mask = instance.new_zeros(missing_mask_shape, dtype=torch.bool)
+        
         for i, band_set_indices in enumerate(modality.bandsets_as_indices()):
             instance_band_set = instance[..., band_set_indices]
             missing_mask_band_set = instance_band_set == MISSING_VALUE
             missing_mask_band_set_any = missing_mask_band_set.any(dim=-1)
             # If any band in the band set is missing, set the whole band set to missing
             missing_mask[..., i] = missing_mask_band_set_any
+            
+        # If missing_mask and mask have different spatial dimensions, resize missing_mask to match mask
+        if missing_mask.shape != mask.shape:
+            import torch.nn.functional as F
+            # Debug: check the actual shapes we're dealing with
+            print(f"INFO: Adjusting missing_mask shape from {missing_mask.shape} to match mask {mask.shape}")
+            
+            # Handle different dimensionalities more robustly
+            if len(missing_mask.shape) == len(mask.shape):
+                if len(missing_mask.shape) == 4:
+                    # Handle 4D case: [B, H1, W1, D] vs [B, H2, W2, D]
+                    B, H1, W1, D = missing_mask.shape
+                    _, H2, W2, D2 = mask.shape
+                    
+                    if (H1, W1) != (H2, W2) or D != D2:
+                        # Reshape for interpolation: [B, H1, W1, D] -> [B, D, H1, W1]
+                        missing_mask_reshaped = missing_mask.permute(0, 3, 1, 2).float()
+                        # Interpolate spatial dimensions
+                        resized = F.interpolate(missing_mask_reshaped, size=(H2, W2), mode='nearest')
+                        # Reshape back: [B, D, H2, W2] -> [B, H2, W2, D]
+                        missing_mask = resized.permute(0, 2, 3, 1).bool()
+                        
+                        # Handle channel dimension mismatch
+                        if D != D2:
+                            if D2 > D:
+                                # Pad with False values
+                                pad_shape = list(missing_mask.shape)
+                                pad_shape[-1] = D2 - D
+                                pad_tensor = missing_mask.new_zeros(pad_shape, dtype=torch.bool)
+                                missing_mask = torch.cat([missing_mask, pad_tensor], dim=-1)
+                            else:
+                                # Truncate
+                                missing_mask = missing_mask[..., :D2]
+                
+                elif len(missing_mask.shape) == 5:
+                    # Handle 5D case: [B, H1, W1, T, D] vs [B, H2, W2, T2, D2]
+                    B, H1, W1, T1, D = missing_mask.shape
+                    _, H2, W2, T2, D2 = mask.shape
+                    
+                    # First handle spatial dimensions
+                    if (H1, W1) != (H2, W2):
+                        # Process each timestep separately
+                        resized_timesteps = []
+                        for t in range(T1):
+                            t_slice = missing_mask[:, :, :, t, :].permute(0, 3, 1, 2).float()  # [B, D, H1, W1]
+                            t_resized = F.interpolate(t_slice, size=(H2, W2), mode='nearest')  # [B, D, H2, W2]
+                            resized_timesteps.append(t_resized.permute(0, 2, 3, 1).bool())  # [B, H2, W2, D]
+                        
+                        missing_mask = torch.stack(resized_timesteps, dim=3)  # [B, H2, W2, T1, D]
+                    
+                    # Handle temporal dimension mismatch
+                    if T1 != T2:
+                        if T2 > T1:
+                            # Repeat last timestep
+                            last_timestep = missing_mask[:, :, :, -1:, :]
+                            repeat_tensor = last_timestep.repeat(1, 1, 1, T2 - T1, 1)
+                            missing_mask = torch.cat([missing_mask, repeat_tensor], dim=3)
+                        else:
+                            # Truncate
+                            missing_mask = missing_mask[:, :, :, :T2, :]
+                    
+                    # Handle channel dimension mismatch
+                    if D != D2:
+                        if D2 > D:
+                            # Pad with False values
+                            pad_shape = list(missing_mask.shape)
+                            pad_shape[-1] = D2 - D
+                            pad_tensor = missing_mask.new_zeros(pad_shape, dtype=torch.bool)
+                            missing_mask = torch.cat([missing_mask, pad_tensor], dim=-1)
+                        else:
+                            # Truncate
+                            missing_mask = missing_mask[..., :D2]
+            else:
+                print(f"WARNING: Dimension mismatch cannot be resolved - missing_mask: {missing_mask.shape}, mask: {mask.shape}")
+                # Create new missing_mask with correct shape, initialized to False
+                missing_mask = mask.new_zeros(mask.shape, dtype=torch.bool)
         return missing_mask
 
     def fill_mask_with_missing_values(

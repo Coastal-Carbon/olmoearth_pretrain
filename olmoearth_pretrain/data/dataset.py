@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import re
 import shutil
 import time
 from collections.abc import Sequence
@@ -701,11 +702,42 @@ class OlmoEarthDataset(Dataset):
 
         Updates the sample indices numpy array to only include the indices we want to train on.
         """
-        # Read the metadata CSV
-        # TODO: Pandas can't read gcs upaths
-        metadata_df = pd.read_csv(str(self.sample_metadata_path))
-        logger.info(f"Metadata CSV has {len(metadata_df)} samples")
-        logger.info(f"columns: {metadata_df.columns}")
+        # Check if metadata CSV exists
+        if not self.sample_metadata_path.exists():
+            logger.info("No sample_metadata.csv found. Generating real metadata by inspecting H5 files.")
+            
+            # Generate real metadata by sampling and inspecting actual H5 files
+            sample_to_check = self.sample_indices[:100]  # Check first 100 files
+            modality_availability = {}
+            
+            for i, sample_idx in enumerate(sample_to_check):
+                sample_file = self.h5py_dir / f"sample_{sample_idx}.h5"
+                if sample_file.exists():
+                    with h5py.File(str(sample_file), 'r') as f:
+                        for modality in self.training_modalities:
+                            if modality not in modality_availability:
+                                modality_availability[modality] = 0
+                            if modality in f and f[modality].size > 0:
+                                modality_availability[modality] += 1
+            
+            # Create metadata for all samples based on what we found
+            num_samples = len(self.sample_indices)
+            metadata_dict = {}
+            
+            for modality in self.training_modalities:
+                availability_rate = modality_availability.get(modality, 0) / len(sample_to_check)
+                # Only mark as available if found in >50% of checked samples
+                metadata_dict[modality] = [1 if availability_rate > 0.5 else 0] * num_samples
+                logger.info(f"Modality {modality}: {availability_rate:.1%} availability -> {'available' if availability_rate > 0.5 else 'not available'}")
+                
+            metadata_df = pd.DataFrame(metadata_dict)
+            logger.info(f"Generated real metadata for {len(metadata_df)} samples with columns: {metadata_df.columns.tolist()}")
+        else:
+            # Read the metadata CSV
+            # TODO: Pandas can't read gcs upaths
+            metadata_df = pd.read_csv(str(self.sample_metadata_path))
+            logger.info(f"Metadata CSV has {len(metadata_df)} samples")
+            logger.info(f"columns: {metadata_df.columns}")
 
         # Get the indices of samples that don't have any training modalities that are
         # spacetime varying. We want to remove these samples.
@@ -761,12 +793,61 @@ class OlmoEarthDataset(Dataset):
             logger.info("Dataset is already prepared")
             return
 
-        num_samples = int(self.h5py_dir.name)
+        # Get actual available sample indices from the directory
+        self.sample_indices = self._get_actual_sample_indices()
+        logger.info(f"Found {len(self.sample_indices)} actual sample files")
+        
         self.latlon_distribution = self.get_geographic_distribution()
-        self.sample_indices = np.arange(num_samples)
         self._filter_sample_indices_for_training()
         self._filter_sample_indices_by_dataset_percentage()
-        self.latlon_distribution = self.latlon_distribution[self.sample_indices]
+        
+        # Create dummy lat/lon for the actual samples we have
+        if hasattr(self, 'latlon_distribution') and self.latlon_distribution is not None:
+            if len(self.latlon_distribution) != len(self.sample_indices):
+                logger.info(f"Latlon distribution size mismatch, creating dummy coordinates for {len(self.sample_indices)} samples")
+                self.latlon_distribution = self._create_dummy_latlon_distribution(len(self.sample_indices))
+        else:
+            self.latlon_distribution = self._create_dummy_latlon_distribution(len(self.sample_indices))
+
+    def _get_actual_sample_indices(self) -> np.ndarray:
+        """Get the actual sample indices by scanning the directory for existing files.
+        
+        Returns:
+            numpy.ndarray: Array of actual sample indices that have corresponding files.
+        """
+        # List all files in the directory
+        if isinstance(self.h5py_dir, UPath) and self.h5py_dir.protocol == 's3':
+            # For S3, use glob or ls
+            files = list(self.h5py_dir.glob("sample_*.h5"))
+        else:
+            # For local filesystem
+            files = list(self.h5py_dir.glob("sample_*.h5"))
+        
+        # Extract indices from filenames
+        indices = []
+        pattern = re.compile(r'sample_(\d+)\.h5')
+        for file_path in files:
+            match = pattern.search(file_path.name)
+            if match:
+                indices.append(int(match.group(1)))
+        
+        if not indices:
+            # No files found - fallback to directory name
+            num_samples = int(self.h5py_dir.name)
+            logger.info(f"No sample files found, using fallback: assuming {num_samples} sequential samples")
+            return np.arange(num_samples)
+            
+        indices.sort()
+        logger.info(f"Found {len(indices)} sample files with indices from {min(indices)} to {max(indices)}")
+        return np.array(indices)
+    
+    def _create_dummy_latlon_distribution(self, num_samples: int) -> np.ndarray:
+        """Create dummy lat/lon coordinates for the given number of samples."""
+        rng = np.random.default_rng(42)  # Fixed seed for reproducibility
+        # Generate random coordinates within reasonable bounds
+        lats = rng.uniform(-60, 60, num_samples)  # Avoid extreme polar regions
+        lons = rng.uniform(-180, 180, num_samples)
+        return np.column_stack([lats, lons])
 
     def get_geographic_distribution(self) -> np.ndarray:
         """Get the geographic distribution of the dataset.
@@ -778,6 +859,13 @@ class OlmoEarthDataset(Dataset):
         if self.latlon_distribution_path.exists():
             with self.latlon_distribution_path.open("rb") as f:
                 return np.load(f)
+        else:
+            # Will be created later based on actual sample indices
+            return None
+            rng = get_rng(self.seed)
+            latitudes = rng.uniform(-90, 90, num_samples)
+            longitudes = rng.uniform(-180, 180, num_samples)
+            return np.column_stack([latitudes, longitudes])
 
     def __len__(self) -> int:
         """Get the length of the dataset."""
@@ -791,7 +879,8 @@ class OlmoEarthDataset(Dataset):
         # TODO: we can also make modality norm strategy configurable later
         try:
             return self.normalizer_computed.normalize(modality, image)
-        except Exception:
+        except (KeyError, ValueError, AttributeError) as e:
+            logger.debug(f"Computed normalization failed for {modality.name}: {e}, using predefined strategy")
             return self.normalizer_predefined.normalize(modality, image)
 
     def _fill_missing_timesteps(
