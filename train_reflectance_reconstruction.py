@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Train reflectance reconstruction head on OlmoEarth base model with W&B logging.
 
@@ -36,8 +35,6 @@ from olmoearth_pretrain.train.masking import MaskedOlmoEarthSample, MaskValue
 
 # Add repo to path
 sys.path.insert(0, '/home/rob/repo/olmoearth_pretrain')
-
-
 
 
 # Get W&B API Key from environment variable
