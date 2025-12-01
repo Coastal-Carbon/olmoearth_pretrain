@@ -15,6 +15,7 @@ import sys
 import json
 import logging
 import time
+import gc
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple
@@ -27,6 +28,7 @@ from torch.amp import autocast
 from torch.cuda.amp import GradScaler
 from upath import UPath
 import wandb
+import boto3
 
 from olmoearth_pretrain.data.dataset import OlmoEarthDataset, GetItemArgs
 from olmoearth_pretrain.data.constants import Modality
@@ -38,7 +40,16 @@ sys.path.insert(0, '/home/rob/repo/olmoearth_pretrain')
 
 
 # Get W&B API Key from environment variable
-WANDB_API_KEY = os.environ.get('WANDB_API_KEY')
+# WANDB_API_KEY = os.environ.get('WANDB_API_KEY')
+
+
+def get_api_key_from_parameter_store(parameter_name: str, region: str = 'us-east-1') -> str:
+    ssm = boto3.client('ssm', region_name=region)
+    response = ssm.get_parameter(
+        Name=parameter_name,
+        WithDecryption=True
+    )
+    return response['Parameter']['Value']
 
 
 # Configuration
@@ -60,38 +71,41 @@ class TrainingConfig:
     freeze_encoder: bool = True
     
     # Training
-    num_epochs: int = 50  # Extended for convergence study
-    batch_size: int = 1
+    num_epochs: int = 100
+    batch_size: int = 2
     gradient_accumulation_steps: int = 1
-    learning_rate: float = 1e-4  # Slightly higher for faster learning
-    max_grad_norm: float = 100.0  # Increased to allow larger gradient updates
+    learning_rate: float = 1e-4
+    max_grad_norm: float = 100.0
     warmup_steps: int = 100
     
     # Data
-    patch_size: int = 8  # Changed from 1 to 8 to reduce memory usage
-    num_samples_per_epoch: int = 20  # Process this many samples per epoch
+    patch_size: int = 8
+    num_samples_per_epoch: int = 20
     train_val_split: float = 0.8
-    max_total_samples: int = None  # Use all available samples (no limit)
-    # Note: With 50 epochs × 20 samples/epoch = 1000 iterations
-    # On 18,000 unique samples, each sample is seen only once (or a few times)
-    max_dataset_files: int = None  # Scan all H5 files to discover all samples
+    max_total_samples: int = 1000
+    max_dataset_files: int = None
     
     # Mixed precision and device
-    use_mixed_precision: bool = False  # Disable for stability with large loss values
-    device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
-    
+    use_mixed_precision: bool = False
+    device: str = "cuda:0"
+
     # W&B
     wandb_project: str = "olmoearth-reconstruction"
     wandb_entity: str = None
-    use_wandb: bool = True  # Enabled for monitoring convergence
+    use_wandb: bool = True
+    wandb_log_every_n_batches: int = 10
+    wandb_log_every_n_val_samples: int = 10
     
     # Checkpointing
-    save_interval: int = 1  # Save every N epochs
-    checkpoint_path: Optional[str] = None  # Resume from checkpoint
+    save_interval: int = 1
+    checkpoint_path: Optional[str] = None
     
     # Head architecture
-    hidden_multiplier: float = 1.0  # Multiplier for hidden layer size (768 * hidden_multiplier)
-    debug_logging: bool = False  # Enable verbose logging for debugging
+    hidden_multiplier: float = 0.8
+    debug_logging: bool = False
+    
+    # Loss weighting
+    alpha: float = 0.3
 class ReflectanceReconstructionHead(nn.Module):
     """Learnable head for spatial image reconstruction from OlmoEarth tokens.
     
@@ -164,32 +178,20 @@ class ReflectanceReconstructionTrainer:
         # Initialize W&B
         self.wandb_enabled = config.use_wandb
         if self.wandb_enabled:
-            try:
-                if WANDB_API_KEY:
-                    wandb.login(key=WANDB_API_KEY, relogin=False)
-                    self.logger.info(f"W&B login successful")
-                else:
-                    self.logger.warning("W&B API key not available, skipping W&B initialization")
-                    self.wandb_enabled = False
-                
-                if self.wandb_enabled:
-                    run = wandb.init(
-                        project=config.wandb_project,
-                        entity=config.wandb_entity,
-                        config=config.__dict__,
-                        save_code=True,
-                    )
-                    self.logger.info(f"✅ W&B initialized successfully: {wandb.run.name}")
-                    self.logger.info(f"   Dashboard URL: {wandb.run.url}")
-            except Exception as e:
-                self.logger.error(f"❌ W&B initialization failed: {e}")
-                import traceback
-                self.logger.error(traceback.format_exc())
-                self.logger.warning("Continuing training without W&B logging")
-                self.wandb_enabled = False
-        else:
-            self.logger.info(f"W&B disabled (use_wandb={config.use_wandb})")
-                
+
+            wandb_api_key = get_api_key_from_parameter_store('/development/hum-ai-model-factory/weights_and_biases_api_key')
+            wandb.login(key=wandb_api_key, relogin=False)
+            self.logger.info(f"W&B login successful")
+
+            run = wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity,
+                config=config.__dict__,
+                save_code=True,
+            )
+            self.logger.info(f"✅ W&B initialized successfully: {wandb.run.name}")
+            self.logger.info(f"   Dashboard URL: {wandb.run.url}")
+
         # Load models
         self._load_models()
         
@@ -395,11 +397,12 @@ class ReflectanceReconstructionTrainer:
         
         return (masked_sample, s2_gt_list, np.array(masked_indices), load_time, num_to_mask, num_timesteps)
     
-    def train_epoch(self, sample_indices: list) -> dict:
+    def train_epoch(self, sample_indices: list, epoch_num: int = 0) -> dict:
         """Train for one epoch.
         
         Args:
             sample_indices: List of sample indices to use for this epoch
+            epoch_num: Current epoch number (for logging)
             
         Returns:
             Dictionary with epoch metrics
@@ -422,9 +425,6 @@ class ReflectanceReconstructionTrainer:
         batch_correlations = []  # Track per-batch correlations
         
         for batch_idx, sample_idx in enumerate(sample_indices):
-            # Stop early if we've processed enough for this epoch
-            if batch_idx >= self.config.num_samples_per_epoch:
-                break
             sample_start = time.time()
             
             # Load sample with timing
@@ -569,30 +569,44 @@ class ReflectanceReconstructionTrainer:
                     mse_t = self.criterion(pred_norm, gt_masked_t_norm)
                     losses_per_masked.append(mse_t)
                     
-                    # Compute spatial correlations for each band
+                    # Compute DIFFERENTIABLE spatial correlations for each band
                     # Correlation across spatial locations (H*W pixels) for each band
+                    # This allows gradients to flow and model to learn spatial patterns
                     pred_flat = pred_norm.reshape(-1, 12)  # (B*H*W, 12) - normalized predictions
                     gt_flat = gt_masked_t_norm.reshape(-1, 12)  # (B*H*W, 12)
                     
                     band_spatial_corrs = []
+                    spatial_corr_loss_t = torch.tensor(0.0, device=pred_flat.device, dtype=pred_flat.dtype)
+                    
                     for band in range(12):
                         gt_vals = gt_flat[:, band]  # (B*H*W,)
                         pred_vals = pred_flat[:, band]  # (B*H*W,)
-                        if gt_vals.std() > 1e-6 and pred_vals.std() > 1e-6:
-                            gt_centered = gt_vals - gt_vals.mean()
-                            pred_centered = pred_vals - pred_vals.mean()
-                            cov = (gt_centered * pred_centered).mean()
-                            spatial_corr = cov / (gt_vals.std() * pred_vals.std() + 1e-8)
-                            band_spatial_corrs.append(spatial_corr.item())
-                            correlations_all.append(spatial_corr.item())
-                        else:
-                            band_spatial_corrs.append(0.0)
-                            correlations_all.append(0.0)
+                        
+                        # Compute correlation with differentiable operations
+                        gt_mean = gt_vals.mean()
+                        pred_mean = pred_vals.mean()
+                        gt_centered = gt_vals - gt_mean
+                        pred_centered = pred_vals - pred_mean
+                        
+                        # Covariance
+                        cov = (gt_centered * pred_centered).mean()
+                        
+                        # Standard deviations
+                        gt_std = (gt_centered ** 2).mean().sqrt()
+                        pred_std = (pred_centered ** 2).mean().sqrt()
+                        
+                        # Correlation: cov / (std_x * std_y)
+                        correlation = cov / (gt_std * pred_std + 1e-8)
+                        band_spatial_corrs.append(correlation.detach().item())
+                        correlations_all.append(correlation.detach().item())
+                        
+                        # DIFFERENTIABLE loss: negative correlation (minimize -corr = maximize corr)
+                        # This WILL backprop and teach spatial pattern matching
+                        spatial_corr_loss_t = spatial_corr_loss_t + (1.0 - correlation) / 12.0
                     
-                    # Spatial correlation loss for this timestep
+                    # Track for monitoring
                     avg_spatial_corr = np.mean(band_spatial_corrs)
-                    spatial_corr_loss = 1.0 - avg_spatial_corr  # Loss: 1 - correlation
-                    spatial_corr_losses.append(spatial_corr_loss)
+                    spatial_corr_losses.append(spatial_corr_loss_t.detach().item())
                     
                     # DEBUG: Log prediction statistics
                     if gt_idx < 1 and batch_idx < 2:  # Only for first masked timestep of first 2 samples
@@ -619,11 +633,17 @@ class ReflectanceReconstructionTrainer:
                 mse_loss = torch.stack(losses_per_masked).mean()
                 mse_loss_scaled = mse_loss  # Keep original scale
                 
-                # Average spatial correlation loss across timesteps
-                spatial_corr_loss_mean = np.mean(spatial_corr_losses) if spatial_corr_losses else 0.0
-                spatial_corr_loss = torch.tensor(spatial_corr_loss_mean, device=pred_estimate.device, requires_grad=True)
+                # Average spatial correlation loss across timesteps (already differentiable tensors)
+                if spatial_corr_losses:
+                    # Convert list of tensors to tensor and average
+                    spatial_corr_loss_tensors = [loss_t if isinstance(loss_t, torch.Tensor) else torch.tensor(loss_t, device=pred_estimate.device) 
+                                                  for loss_t in spatial_corr_losses]
+                    spatial_corr_loss_tensor = torch.stack(spatial_corr_loss_tensors).mean()
+                else:
+                    spatial_corr_loss_tensor = torch.tensor(0.0, device=pred_estimate.device)
                 
                 mean_corr = np.mean(correlations_all) if correlations_all else 0.0
+                spatial_corr_loss_mean = spatial_corr_loss_tensor.detach().item()  # For monitoring
                 
                 # Track per-band spatial correlations for epoch
                 for band_idx in range(12):
@@ -631,11 +651,10 @@ class ReflectanceReconstructionTrainer:
                     if band_corrs:
                         epoch_metrics['per_band_correlations'][band_idx].append(np.mean(band_corrs))
                 
-                # Combined loss: MSE + per-band spatial correlation
-                # Both components important: accuracy (MSE) + spatial structure (correlation)
-                alpha = 0.3  # 30% MSE, 70% spatial correlation - prioritize learning spatial patterns
-                loss = alpha * mse_loss_scaled + (1.0 - alpha) * spatial_corr_loss * 100.0
-                
+                # Combined loss: MSE + DIFFERENTIABLE spatial correlation
+                # Both terms now contribute gradients for spatial pattern learning
+                loss = self.config.alpha * mse_loss_scaled + (1.0 - self.config.alpha) * spatial_corr_loss_tensor * 100.0
+
                 # Track loss and correlation for this batch
                 batch_losses.append(loss.item() * self.config.gradient_accumulation_steps)  # Un-scale for logging
                 if mean_corr is not None:
@@ -643,8 +662,8 @@ class ReflectanceReconstructionTrainer:
                 
                 # DEBUG: Log loss components for first few samples
                 if batch_idx < 3:
-                    self.logger.info(f"  LOSS DEBUG (batch {batch_idx}): MSE={mse_loss_scaled:.6f}, SpatialCorr={spatial_corr_loss:.6f}, Combined={loss*self.config.gradient_accumulation_steps:.6f}")
-                    self.logger.info(f"  LOSS COMPONENTS: MSE contribution={alpha*mse_loss_scaled:.6f}, Corr contribution={(1.0-alpha)*spatial_corr_loss*100.0:.6f}")
+                    self.logger.info(f"  LOSS DEBUG (batch {batch_idx}): MSE={mse_loss_scaled:.6f}, SpatialCorr={spatial_corr_loss_mean:.6f}, Combined={loss.item()*self.config.gradient_accumulation_steps:.6f}")
+                    self.logger.info(f"  LOSS COMPONENTS: MSE contribution={self.config.alpha*mse_loss_scaled:.6f}, Corr contribution={(1.0-self.config.alpha)*spatial_corr_loss_mean*100.0:.6f}")
                     self.logger.info(f"  CORRELATIONS (first 3 bands): {[f'{c:.4f}' for c in correlations_all[:3]]}")
                     self.logger.info(f"  Mean correlation this batch: {mean_corr:.4f}")
                     # Log gradient magnitudes
@@ -658,7 +677,7 @@ class ReflectanceReconstructionTrainer:
                 # Scale loss for gradient accumulation
                 loss = loss / self.config.gradient_accumulation_steps
             head_time = time.time() - head_start
-            
+
             # Backward pass
             if self.scaler:
                 self.scaler.scale(loss).backward()
@@ -705,6 +724,31 @@ class ReflectanceReconstructionTrainer:
                 
                 self.global_step += 1
                 
+                # Log to W&B after each optimizer step (controlled by frequency)
+                if self.wandb_enabled and self.global_step % self.config.wandb_log_every_n_batches == 0:
+                    current_loss = accumulated_loss if accumulated_loss > 0 else (epoch_metrics['loss'][-1] if epoch_metrics['loss'] else 0.0)
+                    wandb_batch_dict = {
+                        'train/batch_loss': current_loss,
+                        'train/learning_rate': self.optimizer.param_groups[0]['lr'],
+                        'global_step': self.global_step,
+                        'epoch': epoch_num,
+                    }
+                    
+                    # Add correlations if available
+                    if batch_correlations:
+                        recent_corr_values = []
+                        for corr_item in batch_correlations[-5:]:
+                            if isinstance(corr_item, dict):
+                                if 'mean' in corr_item:
+                                    recent_corr_values.append(corr_item['mean'])
+                            elif isinstance(corr_item, (int, float)):
+                                recent_corr_values.append(corr_item)
+                        
+                        if recent_corr_values:
+                            wandb_batch_dict['train/batch_corr_mean'] = np.mean(recent_corr_values)
+                    
+                    wandb.log(wandb_batch_dict, step=self.global_step)
+                
                 # Log progress every N accumulation steps
                 if self.global_step % 10 == 0:
                     recent_loss = np.mean(batch_losses[-10:]) if batch_losses else 0.0
@@ -712,6 +756,11 @@ class ReflectanceReconstructionTrainer:
                     self.logger.info(f"  Step {self.global_step}: Loss={recent_loss:.6f}, AvgCorr={recent_corr:.4f}")
             
             sample_time = time.time() - sample_start
+            
+            # Clean up memory after each sample
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
         
         # Compute epoch stats
         metrics = {
@@ -734,7 +783,7 @@ class ReflectanceReconstructionTrainer:
             metrics['train/corr_std'] = np.std(all_corrs)
         
         self.logger.info(f"\n{'='*70}")
-        self.logger.info(f"✅ EPOCH {self.current_epoch + 1} COMPLETE:")
+        self.logger.info(f"✅ EPOCH {epoch_num + 1} COMPLETE:")
         self.logger.info(f"   Avg Loss: {metrics['avg_loss']:.6f}")
         self.logger.info(f"   Processed: {processed}, Skipped: {skipped}")
         self.logger.info(f"   Learning Rate: {metrics['learning_rate']:.2e}")
@@ -902,12 +951,29 @@ class ReflectanceReconstructionTrainer:
                         spatial_corr_loss_mean = np.mean(spatial_corr_losses)
                         
                         # Balance MSE + spatial correlation
-                        alpha = 0.3  # 30% MSE, 70% correlation - match training weighting
-                        combined_loss = alpha * mse_loss_mean + (1.0 - alpha) * spatial_corr_loss_mean * 100.0
+                        combined_loss = self.config.alpha * mse_loss_mean + (1.0 - self.config.alpha) * spatial_corr_loss_mean * 100.0
                         
                         self.logger.info(f"    Avg validation loss (combined): {combined_loss:.6f}")
                         val_losses.append(combined_loss)
                         val_spatial_corr_losses.append(spatial_corr_loss_mean)
+                        
+                        # Log this sample's metrics to W&B (controlled by frequency)
+                        if self.wandb_enabled and (val_idx + 1) % self.config.wandb_log_every_n_val_samples == 0:
+                            sample_corr_mean = np.mean(correlations_all) if correlations_all else 0.0
+                            wandb_val_dict = {
+                                'val/sample_loss': combined_loss,
+                                'val/sample_mse': mse_loss_mean,
+                                'val/sample_spatial_corr_loss': spatial_corr_loss_mean,
+                                'val/sample_corr_mean': sample_corr_mean,
+                                'global_step': self.global_step,
+                            }
+                            
+                            # Add per-band correlations for this sample
+                            for band_idx in range(12):
+                                if band_idx < len(correlations_all):
+                                    wandb_val_dict[f'val/sample_corr_band_{band_idx:02d}'] = correlations_all[band_idx] if band_idx < len(correlations_all) else 0.0
+                            
+                            wandb.log(wandb_val_dict, step=self.global_step)
                     
                     processed += 1
         
@@ -1018,7 +1084,7 @@ class ReflectanceReconstructionTrainer:
             
             # Training
             train_start = time.time()
-            train_metrics = self.train_epoch(shuffled_train_indices)
+            train_metrics = self.train_epoch(shuffled_train_indices, epoch_num=epoch)
             train_time = time.time() - train_start
             
             self.logger.info(
@@ -1049,7 +1115,9 @@ class ReflectanceReconstructionTrainer:
                     'train/loss': train_metrics['avg_loss'],
                     'train/learning_rate': train_metrics['learning_rate'],
                     'val/loss': val_metrics['val_loss'],
+                    'val/spatial_corr_loss': val_metrics.get('val_spatial_corr_loss', 0.0),
                     'global_step': self.global_step,
+                    'train/time_sec': train_time,
                 }
                 
                 # Add per-band correlations for training
@@ -1074,14 +1142,8 @@ class ReflectanceReconstructionTrainer:
                     wandb_dict['val/corr_mean'] = val_metrics['val/corr_mean']
                     wandb_dict['val/corr_std'] = val_metrics['val/corr_std']
                 
-                try:
-                    wandb.log(wandb_dict)
-                    if epoch % 5 == 0:  # Log success every 5 epochs
-                        self.logger.info(f"✅ Logged to W&B (epoch {epoch+1})")
-                except Exception as e:
-                    self.logger.error(f"❌ Failed to log to W&B: {e}")
-                    import traceback
-                    self.logger.error(traceback.format_exc())
+                wandb.log(wandb_dict, step=epoch)
+                self.logger.info(f"✅ Logged to W&B (epoch {epoch+1}) - train_loss={train_metrics['avg_loss']:.6f}, val_loss={val_metrics['val_loss']:.6f}")
             
             # Save checkpoint
             if (epoch + 1) % self.config.save_interval == 0:
@@ -1103,20 +1165,7 @@ class ReflectanceReconstructionTrainer:
 
 def main():
     """Main entry point."""
-    config = TrainingConfig(
-        patch_size=8,
-        num_epochs=50,
-        num_samples_per_epoch=20,
-        batch_size=2,
-        gradient_accumulation_steps=1,
-        learning_rate=1e-4,
-        max_grad_norm=100.0,
-        max_total_samples=1000,  # Use all available samples
-        warmup_steps=100,
-        use_wandb=True,
-        hidden_multiplier=0.8,  # Adjust to control parameters: 0.5 (~370K), 0.25 (~150K), 1.0 (~600K), 2.0 (~2.4M)
-    )
-
+    config = TrainingConfig()
     trainer = ReflectanceReconstructionTrainer(config)
     trainer.train()
 
