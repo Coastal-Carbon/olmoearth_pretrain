@@ -83,11 +83,10 @@ class TrainingConfig:
     num_samples_per_epoch: int = 20
     train_val_split: float = 0.8
     max_total_samples: int = 1000
-    max_dataset_files: int = None
     
     # Mixed precision and device
     use_mixed_precision: bool = False
-    device: str = "cuda:0"
+    device: str = "cuda:1"
 
     # W&B
     wandb_project: str = "olmoearth-reconstruction"
@@ -101,16 +100,18 @@ class TrainingConfig:
     checkpoint_path: Optional[str] = None
     
     # Head architecture
-    hidden_multiplier: float = 0.8
+    hidden_multiplier: float = 1.0
     debug_logging: bool = False
     
     # Loss weighting
     alpha: float = 0.3
+
+
 class ReflectanceReconstructionHead(nn.Module):
     """Learnable head for spatial image reconstruction from OlmoEarth tokens.
     
-    Takes flattened spatial-temporal tokens and reconstructs full spectral images
-    with correct spatial patterns, not just mean values.
+    Takes tokens from unmasked timesteps and reconstructs masked timesteps.
+    Processes each spatial location independently to generate spatially-varying outputs.
     """
     
     def __init__(self, embedding_dim: int = 768, num_bands: int = 12, hidden_multiplier: float = 1.0):
@@ -120,31 +121,31 @@ class ReflectanceReconstructionHead(nn.Module):
         
         hidden_dim = int(embedding_dim * hidden_multiplier)
         
-        # MLP head that outputs full spectral bands directly (not scaled)
+        # MLP head: takes averaged token embeddings (across temporal and spectral dims)
+        # and outputs spectral bands for a single timestep
         self.head = nn.Sequential(
             nn.Linear(embedding_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, num_bands),
         )
         
-        # Don't initialize with large values - let network learn from scratch with standard init
+        # Initialize weights with Xavier uniform for better output scale
+        for module in self.head:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Reconstruct reflectance from OlmoEarth tokens.
         
         Args:
-            x: [B, H, W, T, C, D] or flattened tokens
+            x: (B*H*W*T_unmasked*C_s2, D) flattened token embeddings from unmasked timesteps
             
         Returns:
-            Reflectance: [B, H, W, T, C, num_bands] or same shape as input with num_bands
+            Reflectance: (B*H*W*T_unmasked*C_s2, num_bands)
         """
-        original_shape = x.shape[:-1]
-        x_flat = x.reshape(-1, self.embedding_dim)
-        reflectance = self.head(x_flat)
-        reflectance = reflectance.reshape(*original_shape, self.num_bands)
-        
-        # Output raw reflectance values - no scaling
-        return reflectance
+        return self.head(x)
 
 
 class ReflectanceReconstructionTrainer:
@@ -437,10 +438,6 @@ class ReflectanceReconstructionTrainer:
             
             masked_sample, s2_gt_list, masked_indices, load_time, num_to_mask, num_timesteps = sample_data
             
-            # Log sample info (sparse logging - only every Nth sample)
-            if batch_idx % 10 == 0:
-                self.logger.info(f"  Sample {batch_idx+1}: load={load_time:.2f}s, masked={num_to_mask}/{num_timesteps} timesteps")
-            
             # Forward through frozen base model
             model_start = time.time()
             with torch.no_grad():
@@ -475,16 +472,21 @@ class ReflectanceReconstructionTrainer:
             # Process through reconstruction head
             head_start = time.time()
             device_type = str(self.device).split(':')[0] if ':' in str(self.device) else str(self.device)
+            
             with autocast(device_type=device_type, enabled=self.config.use_mixed_precision):
                 predicted_reflectance_flat = self.head(input_tokens)  # (B*H*W*T_unmasked*C_s2, 12)
                 
-                # Reshape predictions back to per-timestep format
-                # (B*H*W*T_unmasked*C_s2, 12) -> (B, H, W, T_unmasked, C_s2, 12) -> (B, H, W, T_unmasked, 12)
+                # Reshape predictions to spatial resolution, keeping temporal and spectral structure
+                # (B*H*W*T_unmasked*C_s2, 12) -> (B, H, W, T_unmasked, C_s2, 12)
                 pred_per_token = predicted_reflectance_flat.reshape(B, H, W, num_unmasked, C_s2, 12)
-                pred_per_unmasked = pred_per_token.mean(dim=4)  # (B, H, W, T_unmasked, 12) - average over spectral tokens
                 
-                # Average across all unmasked timesteps to get a single estimate
-                pred_estimate = pred_per_unmasked.mean(dim=3)  # (B, H, W, 12)
+                # Average over spectral tokens (C_s2) to get per-spatial-timestep estimates
+                # (B, H, W, T_unmasked, C_s2, 12) -> (B, H, W, T_unmasked, 12)
+                pred_spatial_temporal = pred_per_token.mean(dim=4)
+                
+                # Now average over unmasked timesteps to get prediction for masked timestep
+                # (B, H, W, T_unmasked, 12) -> (B, H, W, 12)
+                pred_spatial = pred_spatial_temporal.mean(dim=3)
                 
                 # Compute loss against all masked timesteps
                 losses_per_masked = []
@@ -492,9 +494,9 @@ class ReflectanceReconstructionTrainer:
                 correlations_all = []
                 
                 for gt_idx, (t_idx, s2_gt_t) in enumerate(zip(masked_indices, s2_gt_list)):
-                    # Use single prediction (averaged across unmasked timesteps) for all masked timesteps
-                    # The reconstruction head learns to predict spectral patterns from unmasked context
-                    pred_t = pred_estimate  # (B, H, W, 12)
+                    # Use spatial predictions from unmasked timesteps averaged
+                    # pred_spatial is shape (B, H, W, 12) - already averaged across unmasked timesteps
+                    pred_t = pred_spatial  # (B, H, W, 12)
                     
                     # Pool GT from full resolution (128, 128) to token resolution (H, W)
                     gt_s2_raw = torch.from_numpy(s2_gt_t).to(self.device).float()  # (H_full, W_full, C_s2)
@@ -509,13 +511,6 @@ class ReflectanceReconstructionTrainer:
                     kernel_size_h = max(1, kernel_size_h)
                     kernel_size_w = max(1, kernel_size_w)
                     
-                    # DEBUG first GT
-                    if gt_idx == 0 and batch_idx < 1:
-                        self.logger.info(f"    GT pooling debug:")
-                        self.logger.info(f"      GT raw shape: {gt_s2_raw.shape}")
-                        self.logger.info(f"      H (token resolution): {H}, W: {W}")
-                        self.logger.info(f"      kernel_size: ({kernel_size_h}, {kernel_size_w})")
-                    
                     # Pool each band separately
                     # Shape: (H_full, W_full, 12) -> pool spatial dims for each band
                     gt_pooled_list = []
@@ -526,11 +521,6 @@ class ReflectanceReconstructionTrainer:
                         gt_pooled_list.append(band_pooled.squeeze(0).squeeze(0))  # (H, W)
                     
                     gt_pooled = torch.stack(gt_pooled_list, dim=-1)  # (H, W, 12)
-                    
-                    # DEBUG pooling result
-                    if gt_idx == 0 and batch_idx < 1:
-                        self.logger.info(f"      GT pooled shape: {gt_pooled.shape}")
-                        self.logger.info(f"      GT pooled band 0 - min: {gt_pooled[:, :, 0].min():.2f}, max: {gt_pooled[:, :, 0].max():.2f}, mean: {gt_pooled[:, :, 0].mean():.2f}")
                     
                     # IMPORTANT: Keep all 12 spectral bands with their spatial structure
                     gt_masked_t = gt_pooled  # (H, W, 12) - all bands preserved
@@ -568,7 +558,7 @@ class ReflectanceReconstructionTrainer:
                     
                     mse_t = self.criterion(pred_norm, gt_masked_t_norm)
                     losses_per_masked.append(mse_t)
-                    
+
                     # Compute DIFFERENTIABLE spatial correlations for each band
                     # Correlation across spatial locations (H*W pixels) for each band
                     # This allows gradients to flow and model to learn spatial patterns
@@ -576,7 +566,7 @@ class ReflectanceReconstructionTrainer:
                     gt_flat = gt_masked_t_norm.reshape(-1, 12)  # (B*H*W, 12)
                     
                     band_spatial_corrs = []
-                    spatial_corr_loss_t = torch.tensor(0.0, device=pred_flat.device, dtype=pred_flat.dtype)
+                    spatial_corr_losses_per_band = []
                     
                     for band in range(12):
                         gt_vals = gt_flat[:, band]  # (B*H*W,)
@@ -602,32 +592,13 @@ class ReflectanceReconstructionTrainer:
                         
                         # DIFFERENTIABLE loss: negative correlation (minimize -corr = maximize corr)
                         # This WILL backprop and teach spatial pattern matching
-                        spatial_corr_loss_t = spatial_corr_loss_t + (1.0 - correlation) / 12.0
+                        spatial_corr_losses_per_band.append((1.0 - correlation) / 12.0)
                     
                     # Track for monitoring
                     avg_spatial_corr = np.mean(band_spatial_corrs)
-                    spatial_corr_losses.append(spatial_corr_loss_t.detach().item())
-                    
-                    # DEBUG: Log prediction statistics
-                    if gt_idx < 1 and batch_idx < 2:  # Only for first masked timestep of first 2 samples
-                        pred_flat_np = pred_t.detach().cpu().numpy().reshape(-1, 12)
-                        pred_std_per_band = [np.std(pred_flat_np[:, b]) for b in range(12)]
-                        gt_flat_np = gt_flat.detach().cpu().numpy() if isinstance(gt_flat, torch.Tensor) else gt_flat
-                        gt_std_per_band = [np.std(gt_flat_np[:, b]) for b in range(12)]
-                        
-                        # MORE DETAILED DEBUG INFO
-                        self.logger.info(f"    GT DATA DEBUG:")
-                        self.logger.info(f"      GT shape: {gt_flat_np.shape}")
-                        self.logger.info(f"      GT min/max (band 0): {np.min(gt_flat_np[:, 0]):.6f} / {np.max(gt_flat_np[:, 0]):.6f}")
-                        self.logger.info(f"      GT mean (band 0): {np.mean(gt_flat_np[:, 0]):.6f}")
-                        self.logger.info(f"      GT unique values count (band 0): {len(np.unique(gt_flat_np[:, 0]))}")
-                        self.logger.info(f"      Pred min/max (band 0): {np.min(pred_flat_np[:, 0]):.6f} / {np.max(pred_flat_np[:, 0]):.6f}")
-                        
-                        self.logger.info(f"    SPATIAL ANALYSIS (timestep {t_idx}):")
-                        self.logger.info(f"      Pred std per band (first 3): {[f'{s:.6f}' for s in pred_std_per_band[:3]]}")
-                        self.logger.info(f"      GT std per band (first 3):   {[f'{s:.6f}' for s in gt_std_per_band[:3]]}")
-                        self.logger.info(f"      Correlations (first 3 bands): {[f'{c:.6f}' for c in band_spatial_corrs[:3]]}")
-                        self.logger.info(f"      Avg correlation: {avg_spatial_corr:.6f}")
+                    # Stack losses and accumulate - all are differentiable tensors
+                    spatial_corr_loss_t = torch.stack(spatial_corr_losses_per_band).sum()
+                    spatial_corr_losses.append(spatial_corr_loss_t)
                 
                 # Average loss across all masked timesteps
                 mse_loss = torch.stack(losses_per_masked).mean()
@@ -635,12 +606,10 @@ class ReflectanceReconstructionTrainer:
                 
                 # Average spatial correlation loss across timesteps (already differentiable tensors)
                 if spatial_corr_losses:
-                    # Convert list of tensors to tensor and average
-                    spatial_corr_loss_tensors = [loss_t if isinstance(loss_t, torch.Tensor) else torch.tensor(loss_t, device=pred_estimate.device) 
-                                                  for loss_t in spatial_corr_losses]
-                    spatial_corr_loss_tensor = torch.stack(spatial_corr_loss_tensors).mean()
+                    # Stack and average - all are already tensors with gradients
+                    spatial_corr_loss_tensor = torch.stack(spatial_corr_losses).mean()
                 else:
-                    spatial_corr_loss_tensor = torch.tensor(0.0, device=pred_estimate.device)
+                    spatial_corr_loss_tensor = torch.tensor(0.0, device=pred_spatial.device)
                 
                 mean_corr = np.mean(correlations_all) if correlations_all else 0.0
                 spatial_corr_loss_mean = spatial_corr_loss_tensor.detach().item()  # For monitoring
@@ -653,46 +622,26 @@ class ReflectanceReconstructionTrainer:
                 
                 # Combined loss: MSE + DIFFERENTIABLE spatial correlation
                 # Both terms now contribute gradients for spatial pattern learning
-                loss = self.config.alpha * mse_loss_scaled + (1.0 - self.config.alpha) * spatial_corr_loss_tensor * 100.0
+                # alpha controls balance: 0.3 = 30% MSE, 70% spatial correlation
+                loss = self.config.alpha * mse_loss_scaled + (1.0 - self.config.alpha) * spatial_corr_loss_tensor
 
                 # Track loss and correlation for this batch
                 batch_losses.append(loss.item() * self.config.gradient_accumulation_steps)  # Un-scale for logging
                 if mean_corr is not None:
                     batch_correlations.append(mean_corr)
                 
-                # DEBUG: Log loss components for first few samples
-                if batch_idx < 3:
-                    self.logger.info(f"  LOSS DEBUG (batch {batch_idx}): MSE={mse_loss_scaled:.6f}, SpatialCorr={spatial_corr_loss_mean:.6f}, Combined={loss.item()*self.config.gradient_accumulation_steps:.6f}")
-                    self.logger.info(f"  LOSS COMPONENTS: MSE contribution={self.config.alpha*mse_loss_scaled:.6f}, Corr contribution={(1.0-self.config.alpha)*spatial_corr_loss_mean*100.0:.6f}")
-                    self.logger.info(f"  CORRELATIONS (first 3 bands): {[f'{c:.4f}' for c in correlations_all[:3]]}")
-                    self.logger.info(f"  Mean correlation this batch: {mean_corr:.4f}")
-                    # Log gradient magnitudes
-                    total_grad_norm = 0.0
-                    for p in self.head.parameters():
-                        if p.grad is not None:
-                            total_grad_norm += p.grad.data.norm(2).item() ** 2
-                    total_grad_norm = total_grad_norm ** 0.5
-                    self.logger.info(f"  GRADIENT: Total norm before step={total_grad_norm:.6e}")
-                
                 # Scale loss for gradient accumulation
                 loss = loss / self.config.gradient_accumulation_steps
             head_time = time.time() - head_start
+            
+            if batch_idx % 10 == 0:
+                self.logger.info(f"    Head+loss time: {head_time:.2f}s, total: {model_time + head_time:.2f}s")
 
             # Backward pass
             if self.scaler:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
-            
-            # DEBUG: Check if we have gradients in head
-            if batch_idx < 2:
-                has_grads = False
-                for name, p in self.head.named_parameters():
-                    if p.grad is not None and p.grad.abs().sum() > 0:
-                        has_grads = True
-                        self.logger.info(f"  PARAM {name}: grad sum={p.grad.abs().sum():.6e}, param sum={p.abs().sum():.6e}")
-                if not has_grads:
-                    self.logger.warning("  WARNING: No gradients found in head parameters!")
             
             accumulated_loss += loss.item()
             processed += 1
@@ -860,11 +809,14 @@ class ReflectanceReconstructionTrainer:
                 with autocast(device_type=device_type, enabled=self.config.use_mixed_precision):
                     predicted_reflectance_flat = self.head(input_tokens)
                     
-                    # Reshape predictions
+                    # Reshape predictions to spatial resolution, keeping all tokens
                     pred_per_token = predicted_reflectance_flat.reshape(B, H, W, num_unmasked, C_s2, 12)
-                    pred_per_unmasked = pred_per_token.mean(dim=4)  # (B, H, W, T_unmasked, 12)
-                    pred_estimate = pred_per_unmasked.mean(dim=3)  # (B, H, W, 12)
-                    self.logger.info(f"    Pred estimate shape: {pred_estimate.shape}")
+                    
+                    # Average over spectral tokens to get per-spatial-timestep estimates
+                    pred_spatial_temporal = pred_per_token.mean(dim=4)  # (B, H, W, T_unmasked, 12)
+                    
+                    # Average over unmasked timesteps to get prediction for masked timestep
+                    pred_spatial = pred_spatial_temporal.mean(dim=3)  # (B, H, W, 12)
                     
                     # Compute loss against all masked timesteps
                     losses_per_masked = []
@@ -872,8 +824,8 @@ class ReflectanceReconstructionTrainer:
                     correlations_all = []
                     
                     for gt_idx, (t_idx, s2_gt_t) in enumerate(zip(masked_indices, s2_gt_list)):
-                        # Use single prediction for all masked timesteps
-                        pred_t = pred_estimate  # (B, H, W, 12)
+                        # Use spatial predictions from unmasked timesteps averaged
+                        pred_t = pred_spatial  # (B, H, W, 12)
                         
                         # Prepare GT for masked timestep
                         # s2_gt_t shape: (H_full, W_full, C_s2)
@@ -951,7 +903,7 @@ class ReflectanceReconstructionTrainer:
                         spatial_corr_loss_mean = np.mean(spatial_corr_losses)
                         
                         # Balance MSE + spatial correlation
-                        combined_loss = self.config.alpha * mse_loss_mean + (1.0 - self.config.alpha) * spatial_corr_loss_mean * 100.0
+                        combined_loss = self.config.alpha * mse_loss_mean + (1.0 - self.config.alpha) * spatial_corr_loss_mean
                         
                         self.logger.info(f"    Avg validation loss (combined): {combined_loss:.6f}")
                         val_losses.append(combined_loss)
