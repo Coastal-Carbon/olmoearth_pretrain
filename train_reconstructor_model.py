@@ -448,8 +448,6 @@ class ReconstructorTrainer:
         # Training loop
         for epoch in range(self.config.num_epochs):
             self.logger.info(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
-            
-            # ==================== TRAINING PHASE ====================
             self.logger.info("Training phase...")
             train_loss = 0.0
             train_samples = 0
@@ -564,8 +562,7 @@ class ReconstructorTrainer:
 
             avg_train_loss = train_loss / max(1, train_samples)
             self.logger.info(f"Epoch {epoch+1} TRAIN: avg_loss={avg_train_loss:.6f} ({train_samples} samples)")
-            
-            # ==================== VALIDATION PHASE ====================
+
             self.logger.info("Validation phase...")
             model.reconstructor.eval()
             val_loss = 0.0
