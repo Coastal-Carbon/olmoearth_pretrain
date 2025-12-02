@@ -47,8 +47,9 @@ class ReconstructorTrainingConfig:
     patch_size: int = 1  # Pixel-level output
     encoder_patch_size: int = 4  # Encoder patch size - keep at 4 to avoid OOM (32×32 latent tokens)
     max_patch_size: int = 1  # ConvTranspose2d kernel size (no upsampling needed at patch_size=1)
-    num_samples_per_epoch: int = 5  # Load 2 samples at a time
+    num_samples_per_epoch: int = 2  # Load 2 samples at a time
     max_total_samples: int = 1000  # Total unique samples to train on
+    val_fraction: float = 0.2  # Use 20% for validation (800 train, 200 val)
 
     # Modalities - specify in one place
     supported_modalities: list = field(
@@ -439,43 +440,35 @@ class ReconstructorTrainer:
             lr=self.config.learning_rate
         )
         
-        # Each epoch will train on the same 1000 samples
-        samples_per_training = 1000
+        # Each epoch will train on 80% and validate on 20% of samples
+        samples_per_training = self.config.max_total_samples
+        num_train_samples = int(samples_per_training * (1.0 - self.config.val_fraction))
+        num_val_samples = samples_per_training - num_train_samples
         
         # Training loop
         for epoch in range(self.config.num_epochs):
-            epoch_loss = 0.0
-            samples_this_epoch = 0
-            
-            # Store images for visualization
-            target_images = []
-            reconstructed_images = []
-
             self.logger.info(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
             
-            # In each epoch, cycle through samples 0-999
-            sample_index = 0
-            samples_loaded_this_epoch = 0
+            # ==================== TRAINING PHASE ====================
+            self.logger.info("Training phase...")
+            train_loss = 0.0
+            train_samples = 0
+            target_images = []
+            reconstructed_images = []
             
-            # Load batches of samples until we've processed 1000
-            while samples_loaded_this_epoch < samples_per_training:
-                # Load a batch of samples upfront
-                batch_size = min(self.config.num_samples_per_epoch, samples_per_training - samples_loaded_this_epoch)
+            sample_index = 0  # Start from sample 0
+            
+            while train_samples < num_train_samples:
+                batch_size = min(self.config.num_samples_per_epoch, num_train_samples - train_samples)
                 samples_to_process = []
-                
-                self.logger.info(f"Loading batch of {batch_size} samples")
                 
                 for _ in range(batch_size):
                     loaded_idx, sample = self._get_sample(sample_index)
                     if sample is not None:
                         samples_to_process.append(sample)
-                    sample_index = (sample_index + 1) % samples_per_training  # Cycle within 0-999
-
-                self.logger.info(f"Loaded {len(samples_to_process)} samples. Progress this epoch: {samples_loaded_this_epoch}/{samples_per_training}")
+                    sample_index += 1  # Sequential, don't cycle
                 
-                # If we loaded samples, process them
                 if not samples_to_process:
-                    self.logger.warning("Failed to load any samples")
                     break
 
                 # Process the batch
@@ -486,73 +479,58 @@ class ReconstructorTrainer:
                         continue
 
                     # Forward pass through encoder (frozen) and decoder (frozen)
-                    # The reconstructor will operate on the encoder's latent embeddings
                     with torch.no_grad():
                         encoder_output, decoder_output, pooled_output, _, _ = model(
                             masked_sample,
-                            patch_size=self.config.encoder_patch_size  # Use larger patch size to reduce memory
+                            patch_size=self.config.encoder_patch_size
                         )
                     
-                    # Get reconstructor output by passing encoder embeddings, not decoder output
-                    # Reconstructor.forward(latent_embeddings, timestamps, patch_size)
-                    # Encoder uses patch_size=4 to avoid OOM, but reconstructor outputs patch_size=1
+                    # Get reconstructor output
                     reconstructed = model.reconstructor(
                         encoder_output,
                         timestamps=masked_sample.timestamps,
-                        patch_size=self.config.patch_size  # Use patch_size=1 for pixel-level output
+                        patch_size=self.config.patch_size
                     )
-                    
-                    # DEBUG: Log shape on first sample of first epoch
-                    if epoch == 0 and samples_this_epoch == 0:
-                        if hasattr(reconstructed, 'sentinel2_l2a'):
-                            self.logger.info(f"DEBUG: reconstructed.sentinel2_l2a shape = {reconstructed.sentinel2_l2a.shape}")
-                            self.logger.info(f"DEBUG: encoder_patch_size = {self.config.encoder_patch_size}")
-                            self.logger.info(f"DEBUG: encoder_output shape = {encoder_output.sentinel2_l2a.shape if hasattr(encoder_output, 'sentinel2_l2a') else 'N/A'}")
                     
                     # Compute loss on masked month using pairwise correlation
                     if hasattr(reconstructed, 'sentinel2_l2a') and reconstructed.sentinel2_l2a is not None:
                         # Get all timesteps for the masked month
                         masked_month_indices = []
-                        for t in range(masked_sample.sentinel2_l2a.shape[3]):  # T dimension
+                        for t in range(masked_sample.sentinel2_l2a.shape[3]):
                             if int(masked_sample.timestamps[0, t, 1]) == mask_month:
                                 masked_month_indices.append(t)
                         
                         if len(masked_month_indices) > 0:
-                            # reconstructed.sentinel2_l2a shape: [B, H, W, T, C] or possibly [B, H, W, T, bandsets, C]
                             recon_s2 = reconstructed.sentinel2_l2a
                             gt_s2 = masked_sample.sentinel2_l2a
                             
-                            # Handle extra embedding dimension if present
-                            if recon_s2.ndim == 7:  # [B, H, W, T, bandsets, embedding_dim, ?]
-                                # This is decoder output with embeddings, not suitable for pixel-level loss
-                                self.logger.warning(f"Reconstructor output has embedding dimension (shape {recon_s2.shape}), skipping this sample")
+                            if recon_s2.ndim == 7:
                                 continue
                             
-                            # Extract masked month
                             recon_month = recon_s2[:, :, :, masked_month_indices, :]
                             gt_month = gt_s2[:, :, :, masked_month_indices, :]
                             
-                            # Ensure same spatial size (reconstructor may upsample)
+                            # Ensure same spatial size
                             if recon_month.shape[1] != gt_month.shape[1] or recon_month.shape[2] != gt_month.shape[2]:
-                                # Crop or pad to match sizes
                                 min_h = min(recon_month.shape[1], gt_month.shape[1])
                                 min_w = min(recon_month.shape[2], gt_month.shape[2])
                                 recon_month = recon_month[:, :min_h, :min_w, :, :]
                                 gt_month = gt_month[:, :min_h, :min_w, :, :]
-                                self.logger.info(f"Resized to match: {recon_month.shape} vs {gt_month.shape}")
                             
-                            # Flatten temporal dimension for loss computation: [B, H, W, T*C] -> [B, H, W, -1]
-                            recon_month_flat = recon_month.reshape(recon_month.shape[0], recon_month.shape[1], recon_month.shape[2], -1)
-                            gt_month_flat = gt_month.reshape(gt_month.shape[0], gt_month.shape[1], gt_month.shape[2], -1)
+                            # Flatten spatial+temporal dimensions, keep channels separate
+                            recon_month_flat = recon_month.reshape(recon_month.shape[0], -1, recon_month.shape[-1])
+                            gt_month_flat = gt_month.reshape(gt_month.shape[0], -1, gt_month.shape[-1])
                             
-                            # Safety check: ensure shapes are reasonable
-                            if recon_month_flat.numel() > 1e8:  # More than 100M elements
-                                self.logger.warning(f"Reconstructor output too large ({recon_month_flat.shape}), skipping to avoid OOM")
+                            if recon_month_flat.numel() > 1e8:
                                 continue
                             
-                            # Compute correlation-only loss WITH per-channel tracking
+                            # Reshape to [B, H, W, C] format for loss function
+                            recon_for_loss = recon_month_flat.unsqueeze(2)
+                            gt_for_loss = gt_month_flat.unsqueeze(2)
+                            
+                            # Compute loss
                             correlation_loss, channel_correlations = compute_pairwise_correlation_loss(
-                                recon_month_flat, gt_month_flat, return_channel_correlations=True
+                                recon_for_loss, gt_for_loss, return_channel_correlations=True
                             )
                             
                             loss = correlation_loss
@@ -563,50 +541,130 @@ class ReconstructorTrainer:
                             torch.nn.utils.clip_grad_norm_(model.reconstructor.parameters(), self.config.max_grad_norm)
                             optimizer.step()
 
-                            epoch_loss += loss.item()
-                            samples_this_epoch += 1
+                            train_loss += loss.item()
+                            train_samples += 1
                             
-                            # Always log per-channel correlations
+                            # Log per-channel correlations
                             s2_band_names = ['B02', 'B03', 'B04', 'B08', 'B05', 'B06', 'B07', 'B8A', 'B11', 'B12', 'B01', 'B09']
                             corr_str = " | ".join([f"{s2_band_names[i]}: {c:+.3f}" for i, c in enumerate(channel_correlations[:12])])
-                            print(f"    Corr: {corr_str}", flush=True)
-                            self.logger.info(f"  Sample {sample_idx+1}/{len(samples_to_process)}: Loss={loss.item():.6f} | {corr_str}")
+                            self.logger.info(f"    Train - Loss={loss.item():.6f} | {corr_str}")
                             
-                            # Also log to WandB if enabled
-                            if wandb_enabled:
-                                wandb_log_dict = {f"channel_corr_{s2_band_names[i]}": c for i, c in enumerate(channel_correlations[:12])}
-                                wandb_log_dict["step_loss"] = loss.item()
-                                wandb_log_dict["step"] = samples_this_epoch + epoch * self.config.num_samples_per_epoch * batch_size
-                                wandb.log(wandb_log_dict)
-
-                            # Store first masked timestep for visualization (only first 4 samples)
+                            # Store images for visualization
                             if len(target_images) < 4:
-                                # Average across all masked timesteps for visualization
-                                # gt_month shape: [B, H, W, num_masked_timesteps, C]
-                                # We want to get first batch, average over time: [H, W, C]
-                                target_avg = gt_month[0].mean(dim=2).detach().cpu().numpy()  # Average over T dimension
-                                recon_avg = recon_month[0].mean(dim=2).detach().cpu().numpy()  # Average over T dimension
+                                target_avg = gt_month[0].mean(dim=2).detach().cpu().numpy()
+                                recon_avg = recon_month[0].mean(dim=2).detach().cpu().numpy()
                                 target_images.append(target_avg)
                                 reconstructed_images.append(recon_avg)
                             
-                            # Clean up GPU memory after each sample
+                            # Clean up GPU memory
                             del masked_sample, encoder_output, decoder_output, pooled_output, reconstructed
                             del recon_month, gt_month, recon_month_flat, gt_month_flat, loss
                             torch.cuda.empty_cache()
-                            gc.collect()  # Force garbage collection
-                
-                samples_loaded_this_epoch += len(samples_to_process)
+                            gc.collect()
 
-            # Log epoch summary
-            avg_loss = epoch_loss / max(1, samples_this_epoch)
-            self.logger.info(f"Epoch {epoch+1} average loss: {avg_loss:.6f} ({samples_this_epoch} samples)")
+            avg_train_loss = train_loss / max(1, train_samples)
+            self.logger.info(f"Epoch {epoch+1} TRAIN: avg_loss={avg_train_loss:.6f} ({train_samples} samples)")
+            
+            # ==================== VALIDATION PHASE ====================
+            self.logger.info("Validation phase...")
+            model.reconstructor.eval()
+            val_loss = 0.0
+            val_samples = 0
+            
+            sample_index = num_train_samples  # Start from sample 800
+            samples_loaded = 0
+            
+            with torch.no_grad():
+                while val_samples < num_val_samples:
+                    batch_size = min(self.config.num_samples_per_epoch, num_val_samples - val_samples)
+                    samples_to_process = []
+                    
+                    for _ in range(batch_size):
+                        loaded_idx, sample = self._get_sample(sample_index)
+                        if sample is not None:
+                            samples_to_process.append(sample)
+                        sample_index += 1  # Sequential
+                    
+                    if not samples_to_process:
+                        break
+
+                    # Process validation batch
+                    for sample_idx, sample in enumerate(samples_to_process):
+                        masked_sample, mask_month = self._create_masked_sample(sample)
+                        if masked_sample is None:
+                            continue
+
+                        encoder_output, decoder_output, pooled_output, _, _ = model(
+                            masked_sample,
+                            patch_size=self.config.encoder_patch_size
+                        )
+                        
+                        reconstructed = model.reconstructor(
+                            encoder_output,
+                            timestamps=masked_sample.timestamps,
+                            patch_size=self.config.patch_size
+                        )
+                        
+                        if hasattr(reconstructed, 'sentinel2_l2a') and reconstructed.sentinel2_l2a is not None:
+                            masked_month_indices = []
+                            for t in range(masked_sample.sentinel2_l2a.shape[3]):
+                                if int(masked_sample.timestamps[0, t, 1]) == mask_month:
+                                    masked_month_indices.append(t)
+                            
+                            if len(masked_month_indices) > 0:
+                                recon_s2 = reconstructed.sentinel2_l2a
+                                gt_s2 = masked_sample.sentinel2_l2a
+                                
+                                if recon_s2.ndim == 7:
+                                    continue
+                                
+                                recon_month = recon_s2[:, :, :, masked_month_indices, :]
+                                gt_month = gt_s2[:, :, :, masked_month_indices, :]
+                                
+                                if recon_month.shape[1] != gt_month.shape[1] or recon_month.shape[2] != gt_month.shape[2]:
+                                    min_h = min(recon_month.shape[1], gt_month.shape[1])
+                                    min_w = min(recon_month.shape[2], gt_month.shape[2])
+                                    recon_month = recon_month[:, :min_h, :min_w, :, :]
+                                    gt_month = gt_month[:, :min_h, :min_w, :, :]
+                                
+                                recon_month_flat = recon_month.reshape(recon_month.shape[0], -1, recon_month.shape[-1])
+                                gt_month_flat = gt_month.reshape(gt_month.shape[0], -1, gt_month.shape[-1])
+                                
+                                if recon_month_flat.numel() > 1e8:
+                                    continue
+                                
+                                recon_for_loss = recon_month_flat.unsqueeze(2)
+                                gt_for_loss = gt_month_flat.unsqueeze(2)
+                                
+                                correlation_loss, channel_correlations = compute_pairwise_correlation_loss(
+                                    recon_for_loss, gt_for_loss, return_channel_correlations=True
+                                )
+                                
+                                val_loss += correlation_loss.item()
+                                val_samples += 1
+                                
+                                s2_band_names = ['B02', 'B03', 'B04', 'B08', 'B05', 'B06', 'B07', 'B8A', 'B11', 'B12', 'B01', 'B09']
+                                corr_str = " | ".join([f"{s2_band_names[i]}: {c:+.3f}" for i, c in enumerate(channel_correlations[:12])])
+                                self.logger.info(f"    Val - Loss={correlation_loss.item():.6f} | {corr_str}")
+                                
+                                del masked_sample, encoder_output, decoder_output, pooled_output, reconstructed
+                                del recon_month, gt_month, recon_month_flat, gt_month_flat
+                                torch.cuda.empty_cache()
+                                gc.collect()
+            
+            model.reconstructor.train()  # Back to training mode
+            
+            avg_val_loss = val_loss / max(1, val_samples)
+            self.logger.info(f"Epoch {epoch+1} VAL: avg_loss={avg_val_loss:.6f} ({val_samples} samples)")
             
             # Log to WandB
             if wandb_enabled:
                 wandb.log({
                     "epoch": epoch + 1,
-                    "avg_loss": avg_loss,
-                    "samples_trained": samples_this_epoch,
+                    "train_loss": avg_train_loss,
+                    "val_loss": avg_val_loss,
+                    "train_samples": train_samples,
+                    "val_samples": val_samples,
                 })
 
             # Save checkpoint
