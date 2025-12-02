@@ -40,7 +40,7 @@ class ReconstructorTrainingConfig:
     
     # Training
     num_epochs: int = 40
-    learning_rate: float = 5e-4
+    learning_rate: float = 5e-3  # Increased from 5e-4 to test if gradients are too small
     max_grad_norm: float = 100.0
 
     # Data
@@ -209,9 +209,6 @@ class ReconstructorTrainer:
         
         # Setup logging
         self.logger = self._setup_logging()
-        self.logger.info("="*80)
-        self.logger.info("OlmoEarth Reconstructor Training: Data Loading")
-        self.logger.info("="*80)
         
         # Create checkpoint directory
         Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -377,13 +374,8 @@ class ReconstructorTrainer:
         
         This method loads the model, creates the Reconstructor, and trains it
         to reconstruct masked Sentinel-2 images from other modalities.
-        """
-        self.logger.info("="*80)
-        self.logger.info("Training Reconstructor")
-        self.logger.info("="*80)
-        
+        """        
         # Initialize WandB
-
         wandb_api_key = get_api_key_from_parameter_store('/development/hum-ai-model-factory/weights_and_biases_api_key')
         wandb.login(key=wandb_api_key)
         wandb.init(
@@ -536,6 +528,17 @@ class ReconstructorTrainer:
                             # Backward pass
                             optimizer.zero_grad()
                             loss.backward()
+                            
+                            # Debug: Check if gradients exist
+                            total_grad_norm = 0.0
+                            for p in model.reconstructor.parameters():
+                                if p.grad is not None:
+                                    total_grad_norm += p.grad.data.norm(2).item() ** 2
+                            total_grad_norm = total_grad_norm ** 0.5
+                            
+                            if total_grad_norm == 0:
+                                self.logger.warning(f"WARNING: No gradients computed! Loss={loss.item():.6f}")
+                            
                             torch.nn.utils.clip_grad_norm_(model.reconstructor.parameters(), self.config.max_grad_norm)
                             optimizer.step()
 
@@ -694,10 +697,8 @@ class ReconstructorTrainer:
                         "reconstruction_visualization": wandb.Image(str(vis_path))
                     })
         
-        self.logger.info("="*80)
         self.logger.info("Training Complete")
-        self.logger.info("="*80)
-        
+
         # Finish WandB run
         if wandb_enabled:
             wandb.finish()
@@ -707,9 +708,7 @@ class ReconstructorTrainer:
 
         Just verify we can iterate through the dataset successfully.
         """
-        self.logger.info("="*80)
         self.logger.info("Looping through training data")
-        self.logger.info("="*80)
         
         # Use a subset of samples
         num_samples = min(self.config.num_samples_per_epoch, len(self.dataset))
@@ -753,9 +752,6 @@ class ReconstructorTrainer:
         # Summary
         elapsed = time.time() - start_time
         self.logger.info("")
-        self.logger.info("="*80)
-        self.logger.info("Stage 1 Summary")
-        self.logger.info("="*80)
         self.logger.info(f"Total time: {elapsed:.1f}s")
         self.logger.info(f"Successful loads: {successful_loads}/{num_samples} ({100*successful_loads/num_samples:.1f}%)")
         self.logger.info(f"Failed loads: {failed_loads}/{num_samples}")
@@ -766,10 +762,6 @@ class ReconstructorTrainer:
             count = modality_counts.get(modality_name, 0)
             pct = 100 * count / successful_loads if successful_loads > 0 else 0
             self.logger.info(f"  - {modality_name}: {count}/{successful_loads} samples ({pct:.1f}%)")
-        self.logger.info("")
-        self.logger.info("="*80)
-        self.logger.info("Stage 1 Complete - Ready to proceed to training")
-        self.logger.info("="*80)
 
 
 if __name__ == "__main__":
