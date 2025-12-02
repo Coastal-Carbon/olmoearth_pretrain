@@ -47,7 +47,7 @@ class ReconstructorTrainingConfig:
     patch_size: int = 1  # Pixel-level output
     encoder_patch_size: int = 4  # Encoder patch size - keep at 4 to avoid OOM (32×32 latent tokens)
     max_patch_size: int = 1  # ConvTranspose2d kernel size (no upsampling needed at patch_size=1)
-    num_samples_per_epoch: int = 2  # Load 2 samples at a time
+    num_samples_per_epoch: int = 5
     max_total_samples: int = 1000  # Total unique samples to train on
     val_fraction: float = 0.2  # Use 20% for validation (800 train, 200 val)
 
@@ -453,7 +453,7 @@ class ReconstructorTrainer:
             train_samples = 0
             target_images = []
             reconstructed_images = []
-            
+
             sample_index = 0  # Start from sample 0
             
             while train_samples < num_train_samples:
@@ -546,6 +546,13 @@ class ReconstructorTrainer:
                             s2_band_names = ['B02', 'B03', 'B04', 'B08', 'B05', 'B06', 'B07', 'B8A', 'B11', 'B12', 'B01', 'B09']
                             corr_str = " | ".join([f"{s2_band_names[i]}: {c:+.3f}" for i, c in enumerate(channel_correlations[:12])])
                             self.logger.info(f"    Train - Loss={loss.item():.6f} | {corr_str}")
+                            
+                            # Log to WandB after each sample
+                            if wandb_enabled:
+                                wandb_log_dict = {f"channel_corr_{s2_band_names[i]}": c for i, c in enumerate(channel_correlations[:12])}
+                                wandb_log_dict["step_loss"] = loss.item()
+                                wandb_log_dict["step"] = train_samples + epoch * num_train_samples
+                                wandb.log(wandb_log_dict)
                             
                             # Store images for visualization
                             if len(target_images) < 4:
@@ -643,6 +650,13 @@ class ReconstructorTrainer:
                                 s2_band_names = ['B02', 'B03', 'B04', 'B08', 'B05', 'B06', 'B07', 'B8A', 'B11', 'B12', 'B01', 'B09']
                                 corr_str = " | ".join([f"{s2_band_names[i]}: {c:+.3f}" for i, c in enumerate(channel_correlations[:12])])
                                 self.logger.info(f"    Val - Loss={correlation_loss.item():.6f} | {corr_str}")
+                                
+                                # Log to WandB after each validation sample
+                                if wandb_enabled:
+                                    wandb_log_dict = {f"val_channel_corr_{s2_band_names[i]}": c for i, c in enumerate(channel_correlations[:12])}
+                                    wandb_log_dict["val_step_loss"] = correlation_loss.item()
+                                    wandb_log_dict["val_step"] = val_samples + epoch * num_val_samples
+                                    wandb.log(wandb_log_dict)
                                 
                                 del masked_sample, encoder_output, decoder_output, pooled_output, reconstructed
                                 del recon_month, gt_month, recon_month_flat, gt_month_flat
