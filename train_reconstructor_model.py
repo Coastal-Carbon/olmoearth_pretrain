@@ -1,10 +1,5 @@
 """
 Train OlmoEarth Reconstructor on OlmoEarth training data.
-
-This script trains the Reconstructor module (which includes per-modality
-reconstruction heads) using multi-modal learning.
-
-Stage 1: Loop through training data and verify data loading.
 """
 
 import sys
@@ -28,8 +23,43 @@ from olmoearth_pretrain.train.masking import MaskValue, MaskedOlmoEarthSample
 from olmoearth_pretrain.model_loader import load_model_from_id, ModelID
 from olmoearth_pretrain.nn.flexi_vit import Reconstructor
 
-# Add repo to path
-sys.path.insert(0, '/home/rob/repo/olmoearth_pretrain')
+
+@dataclass
+class ReconstructorTrainingConfig:
+    """Configuration for training the Reconstructor."""
+    
+    # Paths
+    dataset_path: str = (
+        "s3://cc-dataocean/scratch/20251114_olmo_example/"
+        "h5py_data_w_missing_timesteps_zstd_3_128_x_4/"
+        "cdl_gse_landsat_openstreetmap_raster_"
+        "sentinel1_sentinel2_l2a_srtm_worldcereal_worldcover_worldpop_wri_canopy_height_map/"
+        "1138828"
+    )
+    checkpoint_dir: str = "./checkpoints_reconstructor"
+    
+    # Training
+    num_epochs: int = 40
+    learning_rate: float = 5e-4
+    max_grad_norm: float = 100.0
+
+    # Data
+    patch_size: int = 1  # Pixel-level output
+    encoder_patch_size: int = 4  # Encoder patch size - keep at 4 to avoid OOM (32×32 latent tokens)
+    max_patch_size: int = 1  # ConvTranspose2d kernel size (no upsampling needed at patch_size=1)
+    num_samples_per_epoch: int = 5  # Load 2 samples at a time
+    max_total_samples: int = 1000  # Total unique samples to train on
+
+    # Modalities - specify in one place
+    supported_modalities: list = field(
+        default_factory=lambda: [Modality.SENTINEL1, Modality.SENTINEL2_L2A]
+    )
+
+    # Device
+    device: str = "cuda:1"
+
+    # Modalities to reconstruct
+    supported_modality_names: list = field(default_factory=lambda: ["sentinel1", "sentinel2_l2a", "landsat", "cdl", "latlon"])
 
 
 def get_api_key_from_parameter_store(parameter_name: str, region: str = 'us-east-1') -> str:
@@ -42,7 +72,7 @@ def get_api_key_from_parameter_store(parameter_name: str, region: str = 'us-east
     return response['Parameter']['Value']
 
 
-def compute_pairwise_correlation_loss(reconstructed, ground_truth):
+def compute_pairwise_correlation_loss(reconstructed, ground_truth, return_channel_correlations=False):
     """Compute loss by maximizing correlation between reconstructed and ground truth bands.
     
     For each band (channel), compute the correlation coefficient R between the 
@@ -52,9 +82,11 @@ def compute_pairwise_correlation_loss(reconstructed, ground_truth):
     Args:
         reconstructed: Tensor of shape [B, H, W, C] (reconstructed bands)
         ground_truth: Tensor of shape [B, H, W, C] (original bands)
+        return_channel_correlations: If True, return per-channel correlations for analysis
         
     Returns:
         loss: Scalar loss value (1 - mean_correlation, so minimizing loss maximizes correlation)
+        channel_correlations: (Optional) List of per-channel correlation values for logging
     """
     B, H, W, C = reconstructed.shape
     
@@ -62,9 +94,8 @@ def compute_pairwise_correlation_loss(reconstructed, ground_truth):
     recon_flat = reconstructed.reshape(B, H*W, C)
     gt_flat = ground_truth.reshape(B, H*W, C)
     
-    # Compute correlation for each band
-    total_correlation = 0.0
-    num_channels = 0
+    # Compute correlation for each band using vectorized operations (maintains gradients)
+    correlations = []
     
     # For each sample in batch
     for b in range(B):
@@ -76,7 +107,7 @@ def compute_pairwise_correlation_loss(reconstructed, ground_truth):
             recon_band = recon_b[:, c]  # [H*W]
             gt_band = gt_b[:, c]  # [H*W]
             
-            # Compute Pearson correlation coefficient
+            # Compute Pearson correlation coefficient (all tensor ops to preserve gradients)
             recon_mean = recon_band.mean()
             recon_std = recon_band.std() + 1e-8
             recon_normalized = (recon_band - recon_mean) / recon_std
@@ -87,15 +118,18 @@ def compute_pairwise_correlation_loss(reconstructed, ground_truth):
             
             # Correlation = mean of element-wise product of normalized values
             correlation = torch.mean(recon_normalized * gt_normalized)
-            total_correlation += correlation
-            num_channels += 1
+            correlations.append(correlation)
 
-    # Mean correlation across all bands and batches
-    mean_correlation = total_correlation / num_channels
+    # Stack correlations and compute mean (all tensor ops for backprop)
+    mean_correlation = torch.stack(correlations).mean()
 
     # Loss = 1 - correlation (so maximizing correlation minimizes loss)
     loss = 1.0 - mean_correlation
     
+    if return_channel_correlations:
+        # Extract values for logging AFTER computing loss (doesn't affect gradients)
+        channel_correlations = [c.item() for c in correlations]
+        return loss, channel_correlations
     return loss
 
 
@@ -165,45 +199,6 @@ def visualize_reconstruction_pairs(target_images, reconstructed_images, epoch, o
     return output_path
 
 
-# Configuration
-@dataclass
-class ReconstructorTrainingConfig:
-    """Configuration for training the Reconstructor."""
-    
-    # Paths
-    dataset_path: str = (
-        "s3://cc-dataocean/scratch/20251114_olmo_example/"
-        "h5py_data_w_missing_timesteps_zstd_3_128_x_4/"
-        "cdl_gse_landsat_openstreetmap_raster_"
-        "sentinel1_sentinel2_l2a_srtm_worldcereal_worldcover_worldpop_wri_canopy_height_map/"
-        "1138828"
-    )
-    checkpoint_dir: str = "./checkpoints_reconstructor"
-    
-    # Training
-    num_epochs: int = 40
-    learning_rate: float = 1e-4
-    max_grad_norm: float = 100.0
-
-    # Data
-    patch_size: int = 1  # Note: pixel-level output not currently used (reconstructor outputs at encoder patch size)
-    encoder_patch_size: int = 8  # Encoder AND reconstructor patch size (reduces 128×128 → 16×16)
-    max_patch_size: int = 8  # ConvTranspose2d kernel size (for spatial smoothing)
-    num_samples_per_epoch: int = 20  # Load 20 samples at a time
-    max_total_samples: int = 1000  # Total unique samples to train on
-
-    # Modalities - specify in one place
-    supported_modalities: list = field(
-        default_factory=lambda: [Modality.SENTINEL1, Modality.SENTINEL2_L2A]
-    )
-
-    # Device
-    device: str = "cuda:0"
-
-    # Modalities to reconstruct
-    supported_modality_names: list = field(default_factory=lambda: ["sentinel1", "sentinel2_l2a", "landsat", "cdl", "latlon"])
-
-
 class ReconstructorTrainer:
     """Trainer for OlmoEarth Reconstructor."""
     
@@ -214,7 +209,7 @@ class ReconstructorTrainer:
         # Setup logging
         self.logger = self._setup_logging()
         self.logger.info("="*80)
-        self.logger.info("OlmoEarth Reconstructor Training - Stage 1: Data Loading")
+        self.logger.info("OlmoEarth Reconstructor Training: Data Loading")
         self.logger.info("="*80)
         
         # Create checkpoint directory
@@ -273,7 +268,7 @@ class ReconstructorTrainer:
             _, sample = self.dataset[GetItemArgs(
                 idx=sample_idx,
                 patch_size=self.config.patch_size,  # Dataset-level patch processing
-                sampled_hw_p=128  # Load 128x128 spatial region
+                sampled_hw_p=32  # Load 32x32 spatial region to reduce memory
             )]
             return sample_idx, sample  # Return both idx and sample
         except Exception as e:
@@ -342,7 +337,7 @@ class ReconstructorTrainer:
             dtype=torch.float32,
             device=self.device,
         )
-        
+
         # Mask one random month for Sentinel-2 reconstruction
         # Find all timesteps with the target month
         for t in range(T):
@@ -377,13 +372,13 @@ class ReconstructorTrainer:
         return masked_sample, mask_month
     
     def train(self):
-        """Training loop - Stage 2: Add Reconstructor and train on data.
+        """Training loop: Add Reconstructor and train on data.
         
         This method loads the model, creates the Reconstructor, and trains it
         to reconstruct masked Sentinel-2 images from other modalities.
         """
         self.logger.info("="*80)
-        self.logger.info("Stage 2: Training Reconstructor")
+        self.logger.info("Training Reconstructor")
         self.logger.info("="*80)
         
         # Initialize WandB
@@ -417,6 +412,12 @@ class ReconstructorTrainer:
         
         # Add Reconstructor
         self.logger.info("Creating Reconstructor...")
+        
+        # Set base model to eval mode (encoder/decoder frozen)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+        
         model.reconstructor = Reconstructor(
             decoder=model.decoder,
             supported_modalities=self.config.supported_modalities,
@@ -494,12 +495,19 @@ class ReconstructorTrainer:
                     
                     # Get reconstructor output by passing encoder embeddings, not decoder output
                     # Reconstructor.forward(latent_embeddings, timestamps, patch_size)
-                    # Since encoder used patch_size=8, output is 16x16. Reconstructor with patch_size=8 maintains this.
+                    # Encoder uses patch_size=4 to avoid OOM, but reconstructor outputs patch_size=1
                     reconstructed = model.reconstructor(
                         encoder_output,
                         timestamps=masked_sample.timestamps,
-                        patch_size=self.config.encoder_patch_size  # Match encoder patch size
+                        patch_size=self.config.patch_size  # Use patch_size=1 for pixel-level output
                     )
+                    
+                    # DEBUG: Log shape on first sample of first epoch
+                    if epoch == 0 and samples_this_epoch == 0:
+                        if hasattr(reconstructed, 'sentinel2_l2a'):
+                            self.logger.info(f"DEBUG: reconstructed.sentinel2_l2a shape = {reconstructed.sentinel2_l2a.shape}")
+                            self.logger.info(f"DEBUG: encoder_patch_size = {self.config.encoder_patch_size}")
+                            self.logger.info(f"DEBUG: encoder_output shape = {encoder_output.sentinel2_l2a.shape if hasattr(encoder_output, 'sentinel2_l2a') else 'N/A'}")
                     
                     # Compute loss on masked month using pairwise correlation
                     if hasattr(reconstructed, 'sentinel2_l2a') and reconstructed.sentinel2_l2a is not None:
@@ -510,18 +518,44 @@ class ReconstructorTrainer:
                                 masked_month_indices.append(t)
                         
                         if len(masked_month_indices) > 0:
-                            # reconstructed.sentinel2_l2a shape: [B, H, W, T, C]
-                            recon_month = reconstructed.sentinel2_l2a[:, :, :, masked_month_indices, :]
+                            # reconstructed.sentinel2_l2a shape: [B, H, W, T, C] or possibly [B, H, W, T, bandsets, C]
+                            recon_s2 = reconstructed.sentinel2_l2a
+                            gt_s2 = masked_sample.sentinel2_l2a
                             
-                            # Get ground truth (original sentinel2_l2a data for masked month)
-                            gt_month = masked_sample.sentinel2_l2a[:, :, :, masked_month_indices, :]
+                            # Handle extra embedding dimension if present
+                            if recon_s2.ndim == 7:  # [B, H, W, T, bandsets, embedding_dim, ?]
+                                # This is decoder output with embeddings, not suitable for pixel-level loss
+                                self.logger.warning(f"Reconstructor output has embedding dimension (shape {recon_s2.shape}), skipping this sample")
+                                continue
                             
-                            # Flatten temporal dimension for loss computation
+                            # Extract masked month
+                            recon_month = recon_s2[:, :, :, masked_month_indices, :]
+                            gt_month = gt_s2[:, :, :, masked_month_indices, :]
+                            
+                            # Ensure same spatial size (reconstructor may upsample)
+                            if recon_month.shape[1] != gt_month.shape[1] or recon_month.shape[2] != gt_month.shape[2]:
+                                # Crop or pad to match sizes
+                                min_h = min(recon_month.shape[1], gt_month.shape[1])
+                                min_w = min(recon_month.shape[2], gt_month.shape[2])
+                                recon_month = recon_month[:, :min_h, :min_w, :, :]
+                                gt_month = gt_month[:, :min_h, :min_w, :, :]
+                                self.logger.info(f"Resized to match: {recon_month.shape} vs {gt_month.shape}")
+                            
+                            # Flatten temporal dimension for loss computation: [B, H, W, T*C] -> [B, H, W, -1]
                             recon_month_flat = recon_month.reshape(recon_month.shape[0], recon_month.shape[1], recon_month.shape[2], -1)
                             gt_month_flat = gt_month.reshape(gt_month.shape[0], gt_month.shape[1], gt_month.shape[2], -1)
                             
-                            # Compute pairwise correlation loss
-                            loss = compute_pairwise_correlation_loss(recon_month_flat, gt_month_flat)
+                            # Safety check: ensure shapes are reasonable
+                            if recon_month_flat.numel() > 1e8:  # More than 100M elements
+                                self.logger.warning(f"Reconstructor output too large ({recon_month_flat.shape}), skipping to avoid OOM")
+                                continue
+                            
+                            # Compute correlation-only loss WITH per-channel tracking
+                            correlation_loss, channel_correlations = compute_pairwise_correlation_loss(
+                                recon_month_flat, gt_month_flat, return_channel_correlations=True
+                            )
+                            
+                            loss = correlation_loss
                             
                             # Backward pass
                             optimizer.zero_grad()
@@ -532,8 +566,18 @@ class ReconstructorTrainer:
                             epoch_loss += loss.item()
                             samples_this_epoch += 1
                             
-                            if samples_this_epoch % max(1, batch_size // 5) == 0:
-                                self.logger.info(f"  Sample {sample_idx+1}/{len(samples_to_process)}: Loss={loss.item():.6f}")
+                            # Always log per-channel correlations
+                            s2_band_names = ['B02', 'B03', 'B04', 'B08', 'B05', 'B06', 'B07', 'B8A', 'B11', 'B12', 'B01', 'B09']
+                            corr_str = " | ".join([f"{s2_band_names[i]}: {c:+.3f}" for i, c in enumerate(channel_correlations[:12])])
+                            print(f"    Corr: {corr_str}", flush=True)
+                            self.logger.info(f"  Sample {sample_idx+1}/{len(samples_to_process)}: Loss={loss.item():.6f} | {corr_str}")
+                            
+                            # Also log to WandB if enabled
+                            if wandb_enabled:
+                                wandb_log_dict = {f"channel_corr_{s2_band_names[i]}": c for i, c in enumerate(channel_correlations[:12])}
+                                wandb_log_dict["step_loss"] = loss.item()
+                                wandb_log_dict["step"] = samples_this_epoch + epoch * self.config.num_samples_per_epoch * batch_size
+                                wandb.log(wandb_log_dict)
 
                             # Store first masked timestep for visualization (only first 4 samples)
                             if len(target_images) < 4:
@@ -591,14 +635,14 @@ class ReconstructorTrainer:
     
     def loop_through_data(self):
         """Loop through training data and verify loading.
-        
-        Stage 1: Just verify we can iterate through the dataset successfully.
+
+        Just verify we can iterate through the dataset successfully.
         """
         self.logger.info("="*80)
-        self.logger.info("Stage 1: Looping through training data")
+        self.logger.info("Looping through training data")
         self.logger.info("="*80)
         
-        # Use a subset of samples for stage 1
+        # Use a subset of samples
         num_samples = min(self.config.num_samples_per_epoch, len(self.dataset))
 
         self.logger.info(f"Processing {num_samples} samples from dataset of {len(self.dataset)} total")
@@ -636,7 +680,7 @@ class ReconstructorTrainer:
                 f"Sample {sample_idx+1}/{num_samples}: ✓ Loaded in {load_time:.2f}s | "
                 f"Modalities: {', '.join(modalities_present)}"
             )
-        
+
         # Summary
         elapsed = time.time() - start_time
         self.logger.info("")
@@ -659,17 +703,9 @@ class ReconstructorTrainer:
         self.logger.info("="*80)
 
 
-def main():
-    """Main entry point."""
+if __name__ == "__main__":
+
     config = ReconstructorTrainingConfig()
     trainer = ReconstructorTrainer(config)
-    
-    # Stage 1: Loop through data
     trainer.loop_through_data()
-    
-    # Stage 2: Train
     trainer.train()
-
-
-if __name__ == "__main__":
-    main()
