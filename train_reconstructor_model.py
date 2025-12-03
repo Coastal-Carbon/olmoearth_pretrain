@@ -18,7 +18,7 @@ import wandb
 import boto3
 
 from olmoearth_pretrain.data.dataset import OlmoEarthDataset, GetItemArgs
-from olmoearth_pretrain.data.constants import Modality
+from olmoearth_pretrain.data.constants import Modality, MISSING_VALUE, SENTINEL1_NODATA
 from olmoearth_pretrain.train.masking import MaskValue, MaskedOlmoEarthSample
 from olmoearth_pretrain.model_loader import load_model_from_id, ModelID
 from olmoearth_pretrain.nn.flexi_vit import Reconstructor
@@ -39,8 +39,8 @@ class ReconstructorTrainingConfig:
     checkpoint_dir: str = "./checkpoints_reconstructor"
     
     # Training
-    num_epochs: int = 40
-    learning_rate: float = 5e-3  # Increased from 5e-4 to test if gradients are too small
+    num_epochs: int = 3  # Reduced from 40 for testing
+    learning_rate: float = 5e-3
     max_grad_norm: float = 100.0
 
     # Data
@@ -48,10 +48,11 @@ class ReconstructorTrainingConfig:
     encoder_patch_size: int = 4  # Encoder patch size - keep at 4 to avoid OOM (32×32 latent tokens)
     max_patch_size: int = 1  # ConvTranspose2d kernel size (no upsampling needed at patch_size=1)
     num_samples_per_epoch: int = 5
-    max_total_samples: int = 1000  # Total unique samples to train on
-    val_fraction: float = 0.2  # Use 20% for validation (800 train, 200 val)
+    max_total_samples: int = 100  # Reduced from 1000 for faster testing (80 train, 20 val)
+    val_fraction: float = 0.2  # Use 20% for validation (80 train, 20 val)
 
-    # Modalities - specify in one place
+    # Modalities passed to Reconstructor to define its output structure
+    # These modalities are available in the decoder and will be included in reconstructor output
     supported_modalities: list = field(
         default_factory=lambda: [Modality.SENTINEL1, Modality.SENTINEL2_L2A]
     )
@@ -59,8 +60,12 @@ class ReconstructorTrainingConfig:
     # Device
     device: str = "cuda:1"
 
-    # Modalities to reconstruct
-    supported_modality_names: list = field(default_factory=lambda: ["sentinel1", "sentinel2_l2a", "landsat", "cdl", "latlon"])
+    # Modality names for logging only - used in loop_through_data() to report which modalities
+    # are present in each loaded sample. Does NOT affect training logic.
+    # The actual modalities used in training come from the dataset's modality structure.
+    supported_modality_names: list = field(
+        default_factory=lambda: ["sentinel1", "sentinel2_l2a", "landsat", "cdl", "latlon"]
+    )
 
 
 def get_api_key_from_parameter_store(parameter_name: str, region: str = 'us-east-1') -> str:
@@ -77,7 +82,8 @@ def compute_pairwise_correlation_loss(reconstructed, ground_truth, return_channe
     """Compute loss by maximizing correlation between reconstructed and ground truth bands.
     
     For each band (channel), compute the correlation coefficient R between the 
-    reconstructed band and ground truth band across all spatial pixels.
+    reconstructed band and ground truth band across all spatial pixels, excluding
+    any pixels with missing values (-99999).
     Then maximize the mean correlation across all bands.
     
     Args:
@@ -108,24 +114,42 @@ def compute_pairwise_correlation_loss(reconstructed, ground_truth, return_channe
             recon_band = recon_b[:, c]  # [H*W]
             gt_band = gt_b[:, c]  # [H*W]
             
-            # Compute Pearson correlation coefficient (all tensor ops to preserve gradients)
-            recon_mean = recon_band.mean()
-            recon_std = recon_band.std() + 1e-8
-            recon_normalized = (recon_band - recon_mean) / recon_std
+            # Filter out missing values from both signals
+            # Handle both MISSING_VALUE (-99999) for Sentinel-2 and SENTINEL1_NODATA (-32768) for Sentinel-1
+            valid_mask = (recon_band != MISSING_VALUE) & (recon_band != SENTINEL1_NODATA) & \
+                        (gt_band != MISSING_VALUE) & (gt_band != SENTINEL1_NODATA)
+            recon_valid = recon_band[valid_mask]
+            gt_valid = gt_band[valid_mask]
             
-            gt_mean = gt_band.mean()
-            gt_std = gt_band.std() + 1e-8
-            gt_normalized = (gt_band - gt_mean) / gt_std
+            # Skip if not enough valid pixels
+            if len(recon_valid) < 2:
+                correlation = torch.tensor(0.0, dtype=recon_band.dtype, device=recon_band.device)
+                correlations.append(correlation)
+                continue
+            
+            # Compute Pearson correlation coefficient (all tensor ops to preserve gradients)
+            recon_mean = recon_valid.mean()
+            recon_std = recon_valid.std() + 1e-8
+            recon_normalized = (recon_valid - recon_mean) / recon_std
+            
+            gt_mean = gt_valid.mean()
+            gt_std = gt_valid.std() + 1e-8
+            gt_normalized = (gt_valid - gt_mean) / gt_std
             
             # Correlation = mean of element-wise product of normalized values
             correlation = torch.mean(recon_normalized * gt_normalized)
+            
+            # Replace NaN with 0 (can occur if std is effectively 0 for both signals)
+            if torch.isnan(correlation):
+                correlation = torch.tensor(0.0, dtype=correlation.dtype, device=correlation.device)
+            
             correlations.append(correlation)
 
     # Stack correlations and compute mean (all tensor ops for backprop)
     mean_correlation = torch.stack(correlations).mean()
 
     # Loss = 1 - correlation (so maximizing correlation minimizes loss)
-    loss = 1.0 - mean_correlation
+    loss = torch.ones_like(mean_correlation) - mean_correlation
     
     if return_channel_correlations:
         # Extract values for logging AFTER computing loss (doesn't affect gradients)
@@ -399,10 +423,6 @@ class ReconstructorTrainer:
         model = load_model_from_id(ModelID.OLMOEARTH_V1_BASE)
         model.to(self.device)
         
-        # Freeze encoder to speed up training
-        for param in model.encoder.parameters():
-            param.requires_grad = False
-        
         # Add Reconstructor
         self.logger.info("Creating Reconstructor...")
         
@@ -416,11 +436,11 @@ class ReconstructorTrainer:
             supported_modalities=self.config.supported_modalities,
             max_patch_size=self.config.max_patch_size,  # Use larger kernel for smooth transitions
         )
-        
+
         # Only Reconstructor is trainable
         model.reconstructor.to(self.device)
         model.reconstructor.train()
-        
+
         # Count parameters
         reconstructor_params = sum(p.numel() for p in model.reconstructor.parameters())
         reconstructor_trainable = sum(p.numel() for p in model.reconstructor.parameters() if p.requires_grad)
@@ -447,7 +467,7 @@ class ReconstructorTrainer:
             reconstructed_images = []
 
             sample_index = 0  # Start from sample 0
-            
+
             while train_samples < num_train_samples:
                 batch_size = min(self.config.num_samples_per_epoch, num_train_samples - train_samples)
                 samples_to_process = []
@@ -469,11 +489,15 @@ class ReconstructorTrainer:
                         continue
 
                     # Forward pass through encoder (frozen) and decoder (frozen)
-                    with torch.no_grad():
-                        encoder_output, decoder_output, pooled_output, _, _ = model(
-                            masked_sample,
-                            patch_size=self.config.encoder_patch_size
-                        )
+                    # We don't use torch.no_grad() here because the encoder_output becomes
+                    # an input to the reconstructor. Even though encoder parameters won't receive
+                    # gradients (they have requires_grad=False), the output needs to track gradients
+                    # for the reconstructor parameters to be updated. If encoder_output.requires_grad=False,
+                    # then output.requires_grad will also be False, preventing gradient computation.
+                    encoder_output, decoder_output, pooled_output, _, _ = model(
+                        masked_sample,
+                        patch_size=self.config.encoder_patch_size
+                    )
                     
                     # Get reconstructor output
                     reconstructed = model.reconstructor(
@@ -518,10 +542,34 @@ class ReconstructorTrainer:
                             recon_for_loss = recon_month_flat.unsqueeze(2)
                             gt_for_loss = gt_month_flat.unsqueeze(2)
                             
+                            # DEBUG: Check for NaN/Inf
+                            if torch.isnan(recon_for_loss).any() or torch.isinf(recon_for_loss).any():
+                                self.logger.warning(f"WARNING: Reconstructor output contains NaN/Inf!")
+                                continue
+                            if torch.isnan(gt_for_loss).any() or torch.isinf(gt_for_loss).any():
+                                self.logger.warning(f"WARNING: Ground truth contains NaN/Inf!")
+                                continue
+                            
+                            # Check if reconstructor is just outputting zeros
+                            recon_max_abs = recon_for_loss.abs().max()
+                            gt_max_abs = gt_for_loss.abs().max()
+                            if recon_max_abs < 1e-6:
+                                self.logger.warning(f"WARNING: Reconstructor output is all zeros (max={recon_max_abs:.2e})")
+                                continue
+                            if gt_max_abs < 1e-6:
+                                self.logger.warning(f"WARNING: Ground truth is all zeros (max={gt_max_abs:.2e})")
+                                continue
+                            
                             # Compute loss
                             correlation_loss, channel_correlations = compute_pairwise_correlation_loss(
                                 recon_for_loss, gt_for_loss, return_channel_correlations=True
                             )
+                            
+                            # Check if all correlations are zero (suspicious)
+                            if all(abs(c) < 1e-6 for c in channel_correlations):
+                                self.logger.warning(f"WARNING: All correlations are zero!")
+                                self.logger.warning(f"  Recon shape: {recon_for_loss.shape}, min={recon_for_loss.min():.4f}, max={recon_for_loss.max():.4f}, mean={recon_for_loss.mean():.4f}, std={recon_for_loss.std():.4f}")
+                                self.logger.warning(f"  GT shape: {gt_for_loss.shape}, min={gt_for_loss.min():.4f}, max={gt_for_loss.max():.4f}, mean={gt_for_loss.mean():.4f}, std={gt_for_loss.std():.4f}")
                             
                             loss = correlation_loss
                             
@@ -737,7 +785,8 @@ class ReconstructorTrainer:
             
             successful_loads += 1
             
-            # Log what modalities are available
+            # Log which modalities are available in this sample (for debugging/monitoring only)
+            # Iterates through supported_modality_names to check what's actually present
             modalities_present = []
             for modality_name in self.config.supported_modality_names:
                 if hasattr(sample, modality_name) and getattr(sample, modality_name) is not None:
