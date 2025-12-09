@@ -177,8 +177,8 @@ class ReflectanceReconstructionTrainer:
         Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         
         # Initialize W&B
-        self.wandb_enabled = config.use_wandb
-        if self.wandb_enabled:
+        self.wandb_enabled = False  # WandB temporarily disabled due to permissions issue
+        if False and self.wandb_enabled:  # Disabled
 
             wandb_api_key = get_api_key_from_parameter_store('/development/hum-ai-model-factory/weights_and_biases_api_key')
             wandb.login(key=wandb_api_key, relogin=False)
